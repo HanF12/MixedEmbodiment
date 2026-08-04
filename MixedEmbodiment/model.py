@@ -3,12 +3,6 @@
 Backbone + DETR transformer modules (ResNet backbone, sinusoidal/learned
 position encoding, encoder/decoder transformer stack).
 
-Vendored from ALOHA-mimic/model.py so MixedEmbodiment has no dependency on a
-sibling ALOHA-mimic folder. Unchanged except:
-  - `from position_encoding import *` -> `from .position_encoding import *`
-    (relative import within this package instead of a sys.path hack).
-  - Removed the unused `import IPython; e = IPython.embed()` debug shortcuts
-    (never called anywhere in this file).
 """
 from collections import OrderedDict
 
