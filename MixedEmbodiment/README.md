@@ -1,46 +1,5 @@
 # MixedEmbodiment ACT training
 
-One CLI, three CLI-selectable modalities (robot / human / mixed hand+arm), sharing a
-single ACT/DETR-VAE model. See `config.py` / `core.py` docstrings for the architecture;
-this file is just "how do I run it."
-
-## Can I copy just `sessions/` + `MixedEmbodiment/` into a new repo?
-
-**Yes.** `MixedEmbodiment/` is fully self-contained — it used to import the shared
-backbone/transformer code from a sibling `ALOHA-mimic/` folder, but that code
-(`model.py`, `position_encoding.py` — the ResNet backbone, position encodings, and DETR
-transformer) and the ROS joint listener (`joint_lisener.py`, used only by
-`inference_combined.py`) are now vendored directly inside this folder. Verified by
-actually renaming `ALOHA-mimic/` out of the way and running a full robot+human+mixed
-training step — no code in `MixedEmbodiment/` reaches outside it anymore. So:
-
-```
-<new_repo_root>/
-  MixedEmbodiment/     <- this folder, nothing else required
-  sessions/            <- your data
-```
-
-You still need a Python environment with torch/torchvision/opencv/pandas/numpy/tqdm
-(`wandb` only if you pass `--wandb`) — that's a *runtime* dependency, not a *code*
-dependency, so any environment with those packages works; it doesn't need to be the
-`ALOHA-mimic/.venv` specifically (that's just the one already set up on this machine,
-which is why the examples below invoke it directly). To build a fresh one elsewhere:
-
-```bash
-uv venv && source .venv/bin/activate
-uv pip install --index-url "https://download.pytorch.org/whl/cu124" torch torchvision  # or the CPU wheel
-uv pip install opencv-python-headless pandas numpy tqdm wandb
-```
-
-One more gotcha: `--sessions_root` defaults to the **relative** path `sessions`, resolved
-against your current working directory, not the script's location. Either run commands
-from `<new_repo_root>`, or pass `--sessions_root /absolute/path/to/sessions`.
-
-`MixedEmbodiment/compare_legacy.py` is the exception — it intentionally imports the old
-`Combined_relative_3cam_gripweight` / `MixedEmbodiment_gripweight` packages for
-regression testing and will not run outside this repo. It's not needed for training;
-leave it behind (or delete it) when copying to a new repo.
-
 ## Expected `sessions/` layout
 
 ```
@@ -58,48 +17,28 @@ at an arbitrary custom path per modality.
 
 ## The three trainings
 
-Run from `<repo_root>` with any Python env that has the packages listed above (the
-examples below use `ALOHA-mimic/.venv` since it's already set up on this machine — swap
-in your own venv's python elsewhere). `--embodiments` picks which modalities are
-active; everything else has a sensible default.
 
-**Robot only:**
+**Robot only** (nearest equivalent to `Bimanual-3cam`, but note this still runs the full
+shared `MixedDETRVAE` architecture, not `Bimanual-3cam`'s simpler model — it is not a
+numerically-verified stand-in the way the other two are):
 ```bash
 ALOHA-mimic/.venv/bin/python -m MixedEmbodiment.training_combined \
   --sessions_root sessions --embodiments robot
 ```
 
-**Human only:**
+**Robot + human**:
 ```bash
 ALOHA-mimic/.venv/bin/python -m MixedEmbodiment.training_combined \
-  --sessions_root sessions --embodiments human
+  --sessions_root sessions --embodiments robot,human
 ```
 
-**Mixed only:**
-```bash
-ALOHA-mimic/.venv/bin/python -m MixedEmbodiment.training_combined \
-  --sessions_root sessions --embodiments mixed
-```
-
-**All three jointly (the main EgoMimic-style co-training run — this is the actual
-recommended way to train, the three commands above are mainly useful for debugging one
-modality in isolation):**
+**Robot + human + mixed**:
 ```bash
 ALOHA-mimic/.venv/bin/python -m MixedEmbodiment.training_combined \
   --sessions_root sessions --embodiments robot,human,mixed \
   --wandb --wandb_project mixed-embodiment-3cam-act --run_name my_run
 ```
 
-**Fast sanity check before a real run** (tiny frames, short chunk, one batch/modality,
-exits after one step — use this to catch data/path problems in seconds instead of
-minutes):
-```bash
-ALOHA-mimic/.venv/bin/python -m MixedEmbodiment.training_combined \
-  --sessions_root sessions --embodiments robot,human,mixed \
-  --robot_max_demos 1 --human_max_demos 1 --mixed_max_demos 1 \
-  --resize_factor 0.25 --num_queries 8 --batch 1 --num_workers 0 --cpu \
-  --max_sync_rows 16 --dry_run
-```
 
 Checkpoints and `run_metadata.json` land in `MixedEmbodiment/weights/<run_name>/`
 (`--run_name` defaults to a timestamp); sync CSVs land in
@@ -111,7 +50,7 @@ Checkpoints and `run_metadata.json` land in `MixedEmbodiment/weights/<run_name>/
 | Flag | Default | Notes |
 |---|---|---|
 | `--sessions_root` | `sessions` | Only supported data-input shape; see layout above. |
-| `--embodiments` | `robot,human,mixed` | Comma list from `{robot,human,mixed}`. A requested-but-missing modality is skipped with a warning; fails only if none end up active. |
+| `--embodiments` | `robot,human,mixed` | Exactly one of `robot` / `robot,human` / `robot,human,mixed` — see "The three trainings" above. Any other combination is rejected at startup. A requested modality that's genuinely missing on disk is skipped with a warning; fails only if none end up active. |
 | `--robot_max_demos` | `None` (all) | First N robot demos, sorted by demo ID. |
 | `--human_max_demos` | `None` (all) | First N human demos. |
 | `--mixed_max_demos` | `None` (all) | First N mixed demos **per mixed session root** (i.e. applies separately to `left_robot_right_hand` and `right_robot_left_hand`). |

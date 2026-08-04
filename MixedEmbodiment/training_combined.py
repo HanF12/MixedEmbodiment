@@ -112,8 +112,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="robot,human,mixed",
         help=(
-            "Comma-separated subset of {robot,human,mixed} to train on (default: all). "
-            "A requested modality that isn't found under --sessions_root is skipped "
+            "Which of the three predecessor training regimes to run: 'robot' "
+            "(matches Bimanual-3cam), 'robot,human' (matches "
+            "Combined_relative_3cam_gripweight), or 'robot,human,mixed' (matches "
+            "MixedEmbodiment_gripweight, the default). No other combination is "
+            "accepted — robot is always the anchor, and mixed requires human. A "
+            "requested modality that isn't found under --sessions_root is skipped "
             "with a warning; training fails only if zero modalities end up active."
         ),
     )
@@ -231,6 +235,20 @@ class Args:
         self.use_pose_observation = bool(use_pose_observation)
 
 
+# The only three supported combinations, matching the three predecessor folders
+# exactly: Bimanual-3cam (robot alone — different model class, but this is the
+# nearest equivalent run within this architecture), Combined_relative_3cam_gripweight
+# (robot+human, always required together), and MixedEmbodiment_gripweight
+# (robot+human+mixed). robot is always the anchor; mixed requires human. There is
+# no human-alone, mixed-alone, or human+mixed-without-robot mode — those never
+# existed in any predecessor and aren't validated against one.
+VALID_EMBODIMENT_SETS = (
+    frozenset({"robot"}),
+    frozenset({"robot", "human"}),
+    frozenset({"robot", "human", "mixed"}),
+)
+
+
 def parse_embodiments(spec: str) -> set[str]:
     requested = {tok.strip().lower() for tok in spec.split(",") if tok.strip()}
     unknown = requested - set(EMBODIMENT_NAMES)
@@ -238,6 +256,13 @@ def parse_embodiments(spec: str) -> set[str]:
         raise ValueError(f"Unknown --embodiments entries {sorted(unknown)}; choose from {EMBODIMENT_NAMES}")
     if not requested:
         raise ValueError("--embodiments must name at least one of robot,human,mixed")
+    if frozenset(requested) not in VALID_EMBODIMENT_SETS:
+        raise ValueError(
+            f"--embodiments={sorted(requested)} is not supported. Only robot / "
+            "robot,human / robot,human,mixed are supported (matching Bimanual-3cam / "
+            "Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight respectively) "
+            "— robot is always the anchor, and mixed requires human."
+        )
     return requested
 
 
