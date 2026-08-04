@@ -1,0 +1,384 @@
+"""
+MixedEmbodiment DETR-VAE / ACT model (EgoMimic sharing + mixed modality).
+
+Pose action head predicts relative pose deltas vs the chunk's first observation.
+Joint head predicts absolute joints for robot and mixed.
+
+Shared:
+  - camera backbones + input_proj
+  - ACT transformer + CVAE encoder trunk
+  - pose_action_head: H -> 8
+
+Not shared (modality routing):
+  - robot_input_proj / robot CVAE (robot + mixed)
+  - human_input_proj / human CVAE (human)
+  - joint_action_head (robot + mixed; mixed masks inactive arm in loss)
+
+No embodiment embedding token.
+
+Pose-as-observation (item 8 of the unification request)
+---------------------------------------------------------
+Robot and mixed NEVER receive pose_state (EEF/hand pose) as an observation —
+their proprio (both the transformer's additional token and the CVAE encoder's
+state channel) is always joint_state. This was already true in
+Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight and is
+unchanged here.
+
+Human is the only embodiment whose proprio *is* pose_state, because a human
+demo has no joint encoder. `use_pose_observation` (constructor arg, plumbed
+from --pose_observation) gates this by changing which parameters the human
+pathway is built with — not by masking a fixed set of parameters at forward
+time:
+  - False (new default): human_input_proj / human_cvae_state_proj (the two
+    Linear(POSE_DIM, hidden_dim) adapters that would read pose_state) are not
+    created at all. In their place, two learned constant vectors
+    (human_input_const / human_cvae_state_const, shape [hidden_dim]) stand in
+    for "the current human proprio observation" — the same value every step,
+    independent of pose_state. pose_state is accepted by forward() (for
+    interface uniformity with the other embodiments and because the dataset
+    still returns it) but is never read in this mode. The human pathway then
+    has to predict the relative pose chunk purely from images + the CVAE
+    latent (at train time) or images + z~N(0,I) (at inference).
+  - True (legacy): human_input_proj / human_cvae_state_proj are created and
+    pose_state flows through them unchanged, exactly reproducing
+    Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight.
+  An earlier version of this gate kept the Linear layers always and zeroed
+  pose_state before feeding it in. That worked (zeros in -> the same output
+  regardless of the real pose) but left a Linear(8, hidden_dim) whose weight
+  matrix could never receive gradient (0 input -> 0 gradient w.r.t. weight,
+  every step) for the entire run — dead parameters that only existed to be
+  fed zeros. Making the parameter set itself depend on use_pose_observation
+  removes that dead weight instead of just neutering it.
+
+Note pose_actions (the *target* the CVAE encoder's action channel sees during
+training) are unaffected either way — that is the standard ACT/CVAE
+recognition-network input, discarded at inference when z is sampled from the
+prior, not an "observation" in the sense item 8 is about. human_cvae_action_proj
+(which encodes pose_actions) is therefore always created, regardless of
+use_pose_observation.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+from torch import nn
+from torch.autograd import Variable
+
+from MixedEmbodiment.config import (
+    DEFAULT_USE_POSE_OBSERVATION,
+    EMBODIMENT_HUMAN,
+    EMBODIMENT_MIXED,
+    EMBODIMENT_ROBOT,
+    NUM_CAMERAS,
+    POSE_DIM,
+    ROBOT_JOINT_DIM,
+    validate_camera_names,
+)
+
+from MixedEmbodiment.model import (  # noqa: E402
+    TransformerEncoder,
+    TransformerEncoderLayer,
+    build_backbone,
+    build_transformer,
+)
+
+
+def reparametrize(mu, logvar):
+    std = logvar.div(2).exp()
+    eps = Variable(std.data.new(std.size()).normal_())
+    return mu + std * eps
+
+
+def get_sinusoid_encoding_table(n_position, d_hid):
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
+
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
+    return torch.FloatTensor(sinusoid_table).unsqueeze(0)
+
+
+class MixedDETRVAE(nn.Module):
+    def __init__(
+        self,
+        backbones,
+        transformer,
+        encoder,
+        num_queries,
+        camera_names,
+        *,
+        use_pose_observation: bool = DEFAULT_USE_POSE_OBSERVATION,
+    ):
+        super().__init__()
+        self.num_queries = int(num_queries)
+        self.camera_names = list(camera_names)
+        self.transformer = transformer
+        self.encoder = encoder
+        self.use_pose_observation = bool(use_pose_observation)
+        hidden_dim = transformer.d_model
+        self.hidden_dim = hidden_dim
+
+        self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
+        self.backbones = nn.ModuleList(backbones)
+
+        # Modality-specific proprio adapters (EgoMimic embodiment cue).
+        # Robot/mixed always observe joint_state, so robot_input_proj is
+        # unconditional. Human's adapter only exists when it has something
+        # real to adapt (see module docstring); otherwise a learned constant
+        # takes its place so no Linear(POSE_DIM, hidden_dim) sits unused.
+        self.robot_input_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)  # [B,14] -> [B,H]
+        if self.use_pose_observation:
+            self.human_input_proj = nn.Linear(POSE_DIM, hidden_dim)  # [B,8] -> [B,H]
+        else:
+            self.human_input_const = nn.Parameter(torch.zeros(hidden_dim))
+
+        # Shared pose head (human primary + robot aux) and robot-only joint head
+        self.pose_action_head = nn.Linear(hidden_dim, POSE_DIM)  # [B,K,H] -> [B,K,8]
+        self.joint_action_head = nn.Linear(hidden_dim, ROBOT_JOINT_DIM)  # [B,K,H] -> [B,K,14]
+        self.is_pad_head = nn.Linear(hidden_dim, 1)
+
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
+        # CVAE encoder — separate state/action projs per modality (EgoMimic)
+        self.latent_dim = 32
+        self.cls_embed = nn.Embedding(1, hidden_dim)
+        self.human_cvae_action_proj = nn.Linear(POSE_DIM, hidden_dim)  # always: encodes pose_actions (target), not an observation
+        if self.use_pose_observation:
+            self.human_cvae_state_proj = nn.Linear(POSE_DIM, hidden_dim)
+        else:
+            self.human_cvae_state_const = nn.Parameter(torch.zeros(hidden_dim))
+        self.robot_cvae_state_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)
+        self.robot_cvae_action_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)
+        self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)
+        self.register_buffer(
+            "pos_table",
+            get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim),
+        )
+        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)
+        self.additional_pos_embed = nn.Embedding(2, hidden_dim)
+
+    def _encode_latent(
+        self,
+        *,
+        pose_state: torch.Tensor,
+        pose_actions: torch.Tensor,
+        joint_state: torch.Tensor,
+        joint_actions: torch.Tensor,
+        is_pad: torch.Tensor,
+        embodiment: int,
+    ):
+        """
+        CVAE prior over [CLS, state, action_chunk].
+
+        Robot / mixed path (EgoMimic): joints state + joint action chunk.
+        Human path: pose action chunk always; the state slot is either the
+        real pose_state (use_pose_observation=True) or a learned constant
+        that ignores pose_state entirely (default) — see module docstring.
+        """
+        bs = is_pad.shape[0]
+        if embodiment in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED):
+            if joint_state.shape[-1] != ROBOT_JOINT_DIM:
+                raise ValueError(f"joint_state must be [B,{ROBOT_JOINT_DIM}], got {tuple(joint_state.shape)}")
+            if joint_actions.shape[-1] != ROBOT_JOINT_DIM:
+                raise ValueError(f"joint_actions must be [B,K,{ROBOT_JOINT_DIM}], got {tuple(joint_actions.shape)}")
+            state_embed = self.robot_cvae_state_proj(joint_state).unsqueeze(1)
+            action_embed = self.robot_cvae_action_proj(joint_actions)
+            device = joint_state.device
+        else:
+            if pose_actions.shape[-1] != POSE_DIM:
+                raise ValueError(f"pose_actions must be [B,K,{POSE_DIM}], got {tuple(pose_actions.shape)}")
+            if self.use_pose_observation:
+                if pose_state.shape[-1] != POSE_DIM:
+                    raise ValueError(f"pose_state must be [B,{POSE_DIM}], got {tuple(pose_state.shape)}")
+                state_embed = self.human_cvae_state_proj(pose_state).unsqueeze(1)
+            else:
+                state_embed = self.human_cvae_state_const.view(1, 1, -1).expand(bs, 1, -1)
+            action_embed = self.human_cvae_action_proj(pose_actions)
+            device = pose_actions.device
+
+        cls_embed = self.cls_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
+        encoder_input = torch.cat([cls_embed, state_embed, action_embed], dim=1).permute(1, 0, 2)
+        cls_state_pad = torch.full((bs, 2), False, device=device)
+        is_pad_full = torch.cat([cls_state_pad, is_pad], dim=1)
+        pos_embed = self.pos_table.clone().detach().permute(1, 0, 2)
+        encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad_full)
+        encoder_output = encoder_output[0]
+        latent_info = self.latent_proj(encoder_output)
+        mu = latent_info[:, : self.latent_dim]
+        logvar = latent_info[:, self.latent_dim :]
+        latent_sample = reparametrize(mu, logvar)
+        latent_input = self.latent_out_proj(latent_sample)
+        return latent_input, mu, logvar
+
+    def forward(
+        self,
+        *,
+        pose_state: torch.Tensor,
+        images: torch.Tensor,
+        embodiment,
+        joint_state: torch.Tensor | None = None,
+        camera_mask=None,
+        pose_actions: torch.Tensor | None = None,
+        joint_actions: torch.Tensor | None = None,
+        has_joint_target: bool | None = None,
+        is_pad: torch.Tensor | None = None,
+    ):
+        """
+        Returns dict:
+          pose_pred [B,K,8], joint_pred [B,K,14] or None for human,
+          is_pad_pred [B,K,1], mu, logvar
+        """
+        is_training = pose_actions is not None or joint_actions is not None
+        bs = images.shape[0]
+
+        if isinstance(embodiment, torch.Tensor):
+            emb_ids = embodiment.to(dtype=torch.long, device=images.device).reshape(-1)
+            if emb_ids.numel() == 1:
+                emb_ids = emb_ids.repeat(bs)
+            if not torch.all(emb_ids == emb_ids[0]):
+                raise ValueError("MixedDETRVAE expects a homogeneous embodiment per batch")
+            embodiment_id = int(emb_ids[0].item())
+        else:
+            embodiment_id = int(embodiment)
+
+        if images.shape[1] != NUM_CAMERAS:
+            raise ValueError(f"images must be [B,{NUM_CAMERAS},3,H,W], got {tuple(images.shape)}")
+
+        if joint_state is None:
+            joint_state = torch.zeros(bs, ROBOT_JOINT_DIM, device=images.device, dtype=images.dtype)
+        if has_joint_target is None:
+            has_joint_target = embodiment_id in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED)
+
+        if is_training:
+            if is_pad is None:
+                raise ValueError("Training requires is_pad")
+            if pose_actions is None:
+                pose_actions = torch.zeros(bs, self.num_queries, POSE_DIM, device=images.device, dtype=images.dtype)
+            if joint_actions is None:
+                joint_actions = torch.zeros(
+                    bs, self.num_queries, ROBOT_JOINT_DIM, device=images.device, dtype=images.dtype
+                )
+            latent_input, mu, logvar = self._encode_latent(
+                pose_state=pose_state,
+                pose_actions=pose_actions,
+                joint_state=joint_state,
+                joint_actions=joint_actions,
+                is_pad=is_pad,
+                embodiment=embodiment_id,
+            )
+        else:
+            mu = logvar = None
+            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32, device=images.device)
+            latent_input = self.latent_out_proj(latent_sample)
+
+        if camera_mask is None:
+            camera_mask = torch.ones(bs, NUM_CAMERAS, device=images.device, dtype=torch.float32)
+        else:
+            camera_mask = camera_mask.to(device=images.device, dtype=torch.float32)
+            if camera_mask.ndim == 1:
+                camera_mask = camera_mask.unsqueeze(0).expand(bs, -1)
+            if camera_mask.shape != (bs, NUM_CAMERAS):
+                raise ValueError(f"camera_mask must be [B,{NUM_CAMERAS}], got {tuple(camera_mask.shape)}")
+
+        all_cam_features = []
+        all_cam_pos = []
+        for cam_id in range(NUM_CAMERAS):
+            features, pos = self.backbones[cam_id](images[:, cam_id])
+            features = features[0]
+            pos = pos[0]
+            feat = self.input_proj(features)
+            m = camera_mask[:, cam_id].view(bs, 1, 1, 1)
+            feat = feat * m
+            # Keep pos batchless [1,C,h,w]; scale with homogeneous mask scalar.
+            pos = pos * camera_mask[0, cam_id].view(1, 1, 1, 1)
+            all_cam_features.append(feat)
+            all_cam_pos.append(pos)
+
+        src = torch.cat(all_cam_features, dim=3)
+        pos = torch.cat(all_cam_pos, dim=3)
+
+        # Modality routing (no embedding token)
+        if embodiment_id in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED):
+            if joint_state.shape[-1] != ROBOT_JOINT_DIM:
+                raise ValueError(f"joint_state must be [B,{ROBOT_JOINT_DIM}], got {tuple(joint_state.shape)}")
+            proprio_input = self.robot_input_proj(joint_state)
+        elif embodiment_id == EMBODIMENT_HUMAN:
+            if self.use_pose_observation:
+                if pose_state.shape[-1] != POSE_DIM:
+                    raise ValueError(f"pose_state must be [B,{POSE_DIM}], got {tuple(pose_state.shape)}")
+                proprio_input = self.human_input_proj(pose_state)
+            else:
+                proprio_input = self.human_input_const.view(1, -1).expand(bs, -1)
+        else:
+            raise ValueError(f"Unknown embodiment id {embodiment_id}")
+
+        hs = self.transformer(
+            src,
+            None,
+            self.query_embed.weight,
+            pos,
+            latent_input,
+            proprio_input,
+            self.additional_pos_embed.weight,
+        )[0]  # [B, K, H]
+
+        # Shared pose head always; joint head for robot + mixed
+        pose_pred = self.pose_action_head(hs)
+        joint_pred = (
+            self.joint_action_head(hs)
+            if embodiment_id in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED)
+            else None
+        )
+        is_pad_pred = self.is_pad_head(hs)
+        return {
+            "pose_pred": pose_pred,
+            "joint_pred": joint_pred,
+            "is_pad_pred": is_pad_pred,
+            "mu": mu,
+            "logvar": logvar,
+        }
+
+
+def build_encoder(args):
+    encoder_layer = TransformerEncoderLayer(
+        args.hidden_dim,
+        args.nheads,
+        args.dim_feedforward,
+        args.dropout,
+        "relu",
+        args.pre_norm,
+    )
+    encoder_norm = nn.LayerNorm(args.hidden_dim) if args.pre_norm else None
+    return TransformerEncoder(encoder_layer, args.enc_layers, encoder_norm)
+
+
+def build(args):
+    validate_camera_names(args.camera_names)
+    backbones = [build_backbone(args) for _ in range(NUM_CAMERAS)]
+    transformer = build_transformer(args)
+    encoder = build_encoder(args)
+    model = MixedDETRVAE(
+        backbones,
+        transformer,
+        encoder,
+        num_queries=args.num_queries,
+        camera_names=args.camera_names,
+        use_pose_observation=bool(getattr(args, "use_pose_observation", DEFAULT_USE_POSE_OBSERVATION)),
+    )
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("number of parameters: %.2fM" % (n_parameters / 1e6,))
+    return model
+
+
+def kl_divergence(mu, logvar):
+    if mu.data.ndimension() == 4:
+        mu = mu.view(mu.size(0), mu.size(1))
+    if logvar.data.ndimension() == 4:
+        logvar = logvar.view(logvar.size(0), logvar.size(1))
+    klds = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    total_kld = klds.sum(1).mean(0, True)
+    dimension_wise_kld = klds.mean(0)
+    mean_kld = klds.mean(1).mean(0, True)
+    return total_kld, dimension_wise_kld, mean_kld

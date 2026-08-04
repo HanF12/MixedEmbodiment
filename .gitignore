@@ -1,0 +1,32 @@
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# Recorded data (generated locally)
+aloha-data/
+bird-data/
+joint-data/
+hand-pose-data/
+front-realsense-data/
+bird-realsense-data/
+recording/sessions/
+recording/.recording/
+m-synced-csvs/
+ros_data/
+wandb/
+sessions/
+
+# Model artifacts
+weights/
+ALOHA-mimic/weights*/
+*.pth
+*.npz
+*.png
+
+# Joint dump helpers
+joint_timestamp_*.npy
+joint_position_*.npy
+*.hdf5
+
+# AI configs
+.claude
