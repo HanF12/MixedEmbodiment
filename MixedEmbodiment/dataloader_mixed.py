@@ -54,8 +54,8 @@ class MixedEpisodeDataset(Dataset):
     Cameras [3] = bird + active wrist; inactive wrist zeroed/masked.
     Front RGB is used only in sync CSV generation (not loaded here).
     Proprio / CVAE follow the robot joint pathway (see core.py) — mixed never
-    feeds pose_state into the model as an observation, with or without
-    --pose_observation (that flag only affects the human embodiment).
+    feeds pose_state into the model as an observation. No embodiment does;
+    human has no proprio observation at all (see core.py's module docstring).
     """
 
     def __init__(

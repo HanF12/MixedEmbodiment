@@ -20,9 +20,9 @@ Robot joints:
   load with a shared threshold (--gripper_binarize_threshold).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
-Human proprio: absolute pose [8] by default DISABLED (see POSE_OBSERVATION below) —
-  the model instead only ever sees a zeroed placeholder for the human proprio slot
-  and must predict relative pose purely from video + the CVAE latent.
+Human proprio: none. The human embodiment has no proprio observation at all —
+  no adapter, no placeholder token — and must predict relative pose purely
+  from video + the CVAE latent (see core.py module docstring).
 
 Third modality (mixed):
   left_robot_right_hand + right_robot_left_hand are one modality (ConcatDataset).
@@ -58,7 +58,7 @@ DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
 # Tunable mixed modality loss scale (also exposed as --mixed_lambda).
 # L_mixed = mixed_lambda * (pose + joint + KL) before equal mean over modalities.
-DEFAULT_MIXED_LAMBDA = 1.0
+DEFAULT_MIXED_LAMBDA = 0.1
 DEFAULT_RECON_LOSS = "l1"
 # Gripper emphasis (the "gripweight" feature): scales per-element recon error on
 # gripper dims of both the shared pose head and the robot/mixed joint head.
@@ -72,14 +72,11 @@ DEFAULT_GRIPPER_LOSS_WEIGHT = 5.0
 ACTION_CHUNK_STARTS_AT_CURRENT = True
 POSE_ACTION_RELATIVE_TO_CHUNK_ANCHOR = True
 
-# Whether the human proprio slot is allowed to carry the true absolute hand pose.
-# Default is False: the human (and, structurally, robot/mixed already never do
-# this) embodiment never receives absolute pose as an observation — only images
-# + the CVAE latent drive the prediction, and the model is scored purely on how
-# well it predicts the *relative* pose chunk. Set True (via --pose_observation)
-# to reproduce the legacy Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight
-# behavior, where the human's absolute pose at time t was fed in as proprio.
-DEFAULT_USE_POSE_OBSERVATION = False
+# No embodiment ever receives absolute pose as an observation. Robot/mixed
+# proprio is always joint_state; human has no proprio observation at all —
+# only images + the CVAE latent drive the prediction, and the model is scored
+# purely on how well it predicts the *relative* pose chunk. See core.py's
+# module docstring for the (now removed) legacy --pose_observation history.
 
 # --- Robot joints ---
 ROBOT_JOINT_DIM = 14
@@ -457,7 +454,6 @@ def build_run_metadata(
     mixed_data_roots: list[str | Path] | tuple[str | Path, ...] | None,
     num_queries: int,
     max_skew_s: float,
-    use_pose_observation: bool,
     gripper_binarize_threshold: float,
     pose_loss_weight: float = 1.0,
     joint_loss_weight: float = 1.0,
@@ -478,15 +474,12 @@ def build_run_metadata(
         "embodiments": list(embodiments),
         "pose_layout": "xyz+gripper only (8D); rot6d dropped at load",
         "pose_action_space": "relative_to_chunk_anchor",
-        "pose_observation": bool(use_pose_observation),
+        "pose_observation": False,
         "pose_observation_semantics": (
-            "True: human proprio + CVAE state channel receive the true absolute "
-            "pose at t (legacy Combined_relative_3cam_gripweight / "
-            "MixedEmbodiment_gripweight behavior). "
-            "False (default): human proprio + CVAE state channel are zeroed; the "
-            "model predicts the relative pose chunk from images + latent only. "
-            "Robot/mixed never receive pose as an observation either way "
-            "(their proprio is always joint_state)."
+            "No embodiment ever receives absolute pose as an observation. Human "
+            "has no proprio observation at all (no adapter, no placeholder "
+            "token) and predicts the relative pose chunk from images + latent "
+            "only. Robot/mixed proprio is always joint_state."
         ),
         "embodiment_cue": "modality routing (separate projs/heads/cams), no embedding token",
         "mixed_policy": (

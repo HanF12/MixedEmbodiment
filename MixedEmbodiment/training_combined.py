@@ -17,8 +17,10 @@ and MixedEmbodiment_gripweight packages.
   packages
 - Gripper emphasis ("gripweight"): --gripper_loss_weight scales recon error on
   pose grip dims (3,7) and joint grip dims (6,13); default 5.0
-- Pose-as-observation: --pose_observation (off by default) controls whether the
-  human embodiment ever sees its own absolute pose as an input; see core.py
+- No embodiment ever observes absolute pose: robot/mixed proprio is always
+  joint_state, and the human embodiment has no proprio observation at all
+  (predicts the relative pose chunk from images + CVAE latent only); see
+  core.py's module docstring.
 """
 
 from __future__ import annotations
@@ -56,7 +58,6 @@ from MixedEmbodiment.config import (  # noqa: E402
     DEFAULT_NUM_QUERIES,
     DEFAULT_RECON_LOSS,
     DEFAULT_SESSIONS_ROOT,
-    DEFAULT_USE_POSE_OBSERVATION,
     DEFAULT_WEIGHT_DECAY,
     EMBODIMENT_HUMAN,
     EMBODIMENT_MIXED,
@@ -189,20 +190,6 @@ def parse_args() -> argparse.Namespace:
         help="Average active-modality losses then one optimizer step (default). "
         "Use --no-joint_modality_update for alternating single-modality steps.",
     )
-    p.add_argument(
-        "--pose_observation",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_USE_POSE_OBSERVATION,
-        help=(
-            "If set, the human embodiment's absolute pose at the current timestep is "
-            "fed into the model as an observation via a real Linear adapter (legacy "
-            "Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight behavior). "
-            "Default (unset): that adapter is not even constructed; a learned constant "
-            "stands in its place, so the model must predict the relative pose chunk from "
-            "video alone. Robot/mixed are unaffected either way (their proprio is always "
-            "joint_state)."
-        ),
-    )
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="mixed-embodiment-3cam-act")
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -217,7 +204,7 @@ def parse_args() -> argparse.Namespace:
 
 
 class Args:
-    def __init__(self, num_queries: int, *, use_pose_observation: bool):
+    def __init__(self, num_queries: int):
         self.num_queries = num_queries
         self.camera_names = list(MODEL_CAMERA_NAMES)
         self.hidden_dim = 512
@@ -232,7 +219,6 @@ class Args:
         self.lr_backbone = 1e-5
         self.masks = False
         self.dilation = False
-        self.use_pose_observation = bool(use_pose_observation)
 
 
 # The only three supported combinations, matching the three predecessor folders
@@ -651,7 +637,6 @@ def main() -> None:
         mixed_data_roots=mixed_roots,
         num_queries=cli.num_queries,
         max_skew_s=cli.max_skew_s,
-        use_pose_observation=bool(cli.pose_observation),
         gripper_binarize_threshold=gripper_thr,
         pose_loss_weight=cli.pose_loss_weight,
         joint_loss_weight=cli.joint_loss_weight,
@@ -669,8 +654,8 @@ def main() -> None:
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
-    print(f"Using device: {device}; active embodiments: {sorted(active)}; pose_observation={bool(cli.pose_observation)}")
-    model = build(Args(cli.num_queries, use_pose_observation=bool(cli.pose_observation))).to(device)
+    print(f"Using device: {device}; active embodiments: {sorted(active)}")
+    model = build(Args(cli.num_queries)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cli.lr, weight_decay=cli.weight_decay)
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)

@@ -54,9 +54,9 @@ class RobotEpisodeDataset(Dataset):
 
     Note: pose_state is computed here for completeness / logging parity with the
     human dataset, but the robot embodiment NEVER feeds it into the model as an
-    observation (core.py's robot/mixed proprio path uses joint_state only,
-    regardless of --pose_observation). It exists only so pose_actions (the
-    shared-head auxiliary target) can be built relative to a well-defined anchor.
+    observation (core.py's robot/mixed proprio path uses joint_state only). It
+    exists only so pose_actions (the shared-head auxiliary target) can be built
+    relative to a well-defined anchor.
 
     Returns dict (common batch schema):
       embodiment, images, camera_mask,

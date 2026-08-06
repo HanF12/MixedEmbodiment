@@ -9,7 +9,7 @@ but drives MixedEmbodiment.MixedDETRVAE with:
   - camera slots [bird, left_wrist, right_wrist] (true 3-cam; no front)
   - shared pose head is xyz+gripper (8D); control from joint_action_head only
   - MixedEmbodiment training also has human/mixed modalities; this script uses
-    the robot joint path only (--pose_observation never applies to it)
+    the robot joint path only (no embodiment ever observes absolute pose)
 
 Relative vs absolute
 --------------------
@@ -235,10 +235,6 @@ class Args:
         self.lr_backbone = 1e-5
         self.masks = False
         self.dilation = False
-        # Inference always drives the robot/joint pathway, which never reads
-        # pose_state as an observation regardless of this flag; kept False
-        # (the new default) purely so build() has a value to read.
-        self.use_pose_observation = False
 
 
 parser = argparse.ArgumentParser(description="MixedEmbodiment ACT inference (robot/joint pathway; absolute joint targets)")

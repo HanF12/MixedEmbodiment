@@ -11,7 +11,7 @@ Shared:
 
 Not shared (modality routing):
   - robot_input_proj / robot CVAE (robot + mixed)
-  - human_input_proj / human CVAE (human)
+  - human CVAE action proj (human has no proprio adapter — no observation)
   - joint_action_head (robot + mixed; mixed masks inactive arm in loss)
 
 No embodiment embedding token.
@@ -24,38 +24,43 @@ state channel) is always joint_state. This was already true in
 Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight and is
 unchanged here.
 
-Human is the only embodiment whose proprio *is* pose_state, because a human
-demo has no joint encoder. `use_pose_observation` (constructor arg, plumbed
-from --pose_observation) gates this by changing which parameters the human
-pathway is built with — not by masking a fixed set of parameters at forward
-time:
-  - False (new default): human_input_proj / human_cvae_state_proj (the two
-    Linear(POSE_DIM, hidden_dim) adapters that would read pose_state) are not
-    created at all. In their place, two learned constant vectors
-    (human_input_const / human_cvae_state_const, shape [hidden_dim]) stand in
-    for "the current human proprio observation" — the same value every step,
-    independent of pose_state. pose_state is accepted by forward() (for
-    interface uniformity with the other embodiments and because the dataset
-    still returns it) but is never read in this mode. The human pathway then
-    has to predict the relative pose chunk purely from images + the CVAE
-    latent (at train time) or images + z~N(0,I) (at inference).
-  - True (legacy): human_input_proj / human_cvae_state_proj are created and
-    pose_state flows through them unchanged, exactly reproducing
-    Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight.
-  An earlier version of this gate kept the Linear layers always and zeroed
-  pose_state before feeding it in. That worked (zeros in -> the same output
-  regardless of the real pose) but left a Linear(8, hidden_dim) whose weight
-  matrix could never receive gradient (0 input -> 0 gradient w.r.t. weight,
-  every step) for the entire run — dead parameters that only existed to be
-  fed zeros. Making the parameter set itself depend on use_pose_observation
-  removes that dead weight instead of just neutering it.
+Human is the only embodiment whose proprio *could be* pose_state, because a
+human demo has no joint encoder. It never is: the human pathway has no
+proprio observation at all, structurally, not just a masked-out one.
+
+  - No human_input_proj / human_cvae_state_proj: there is no
+    Linear(POSE_DIM, hidden_dim) adapter that reads pose_state as an
+    observation.
+  - No placeholder in their place either. An earlier version of this model
+    stood a learned constant vector (human_input_const / human_cvae_state_const)
+    in for "the current human proprio observation" when the real adapter was
+    disabled. That constant is the same value every step regardless of
+    pose_state, so it carries no information a bias term inside the
+    surrounding heads couldn't already supply — it was a token that existed
+    only to be a token. Removing it means the human embodiment simply omits
+    a proprio token everywhere one would have gone: one fewer token in the
+    transformer's extra-token slot (additional_inputs, see model.py) and one
+    fewer token in the CVAE encoder's [CLS, state, action] sequence (which
+    becomes [CLS, action] for human).
+  - pose_state is still accepted by forward() and still populated by
+    HumanEpisodeDataset — the dataset needs it as the anchor for computing
+    the relative pose_actions target — but the model never reads it as an
+    observation. The human pathway predicts the relative pose chunk purely
+    from images + the CVAE latent (at train time) or images + z~N(0,I) (at
+    inference).
+
+An even earlier version zeroed pose_state and fed it through a Linear layer
+that was always constructed. That left a Linear(8, hidden_dim) whose weight
+matrix could never receive gradient (0 input -> 0 gradient w.r.t. weight,
+every step) for the entire run. The learned-constant version above fixed the
+dead-gradient problem but still spent a token and a parameter vector on
+carrying zero information. Dropping the token entirely removes both.
 
 Note pose_actions (the *target* the CVAE encoder's action channel sees during
-training) are unaffected either way — that is the standard ACT/CVAE
-recognition-network input, discarded at inference when z is sampled from the
-prior, not an "observation" in the sense item 8 is about. human_cvae_action_proj
-(which encodes pose_actions) is therefore always created, regardless of
-use_pose_observation.
+training) are unaffected — that is the standard ACT/CVAE recognition-network
+input, discarded at inference when z is sampled from the prior, not an
+"observation" in the sense item 8 is about. human_cvae_action_proj (which
+encodes pose_actions) is always created.
 """
 
 from __future__ import annotations
@@ -66,7 +71,6 @@ from torch import nn
 from torch.autograd import Variable
 
 from MixedEmbodiment.config import (
-    DEFAULT_USE_POSE_OBSERVATION,
     EMBODIMENT_HUMAN,
     EMBODIMENT_MIXED,
     EMBODIMENT_ROBOT,
@@ -108,15 +112,12 @@ class MixedDETRVAE(nn.Module):
         encoder,
         num_queries,
         camera_names,
-        *,
-        use_pose_observation: bool = DEFAULT_USE_POSE_OBSERVATION,
     ):
         super().__init__()
         self.num_queries = int(num_queries)
         self.camera_names = list(camera_names)
         self.transformer = transformer
         self.encoder = encoder
-        self.use_pose_observation = bool(use_pose_observation)
         hidden_dim = transformer.d_model
         self.hidden_dim = hidden_dim
 
@@ -124,15 +125,11 @@ class MixedDETRVAE(nn.Module):
         self.backbones = nn.ModuleList(backbones)
 
         # Modality-specific proprio adapters (EgoMimic embodiment cue).
-        # Robot/mixed always observe joint_state, so robot_input_proj is
-        # unconditional. Human's adapter only exists when it has something
-        # real to adapt (see module docstring); otherwise a learned constant
-        # takes its place so no Linear(POSE_DIM, hidden_dim) sits unused.
+        # Robot/mixed always observe joint_state. Human has no proprio
+        # observation at all (see module docstring) — no adapter, no
+        # placeholder constant; the human forward path below simply omits a
+        # proprio token everywhere one would otherwise go.
         self.robot_input_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)  # [B,14] -> [B,H]
-        if self.use_pose_observation:
-            self.human_input_proj = nn.Linear(POSE_DIM, hidden_dim)  # [B,8] -> [B,H]
-        else:
-            self.human_input_const = nn.Parameter(torch.zeros(hidden_dim))
 
         # Shared pose head (human primary + robot aux) and robot-only joint head
         self.pose_action_head = nn.Linear(hidden_dim, POSE_DIM)  # [B,K,H] -> [B,K,8]
@@ -141,28 +138,32 @@ class MixedDETRVAE(nn.Module):
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
-        # CVAE encoder — separate state/action projs per modality (EgoMimic)
+        # CVAE encoder — separate state/action projs per modality (EgoMimic).
+        # Human's CVAE encoder sequence has no state token (see _encode_latent).
         self.latent_dim = 32
         self.cls_embed = nn.Embedding(1, hidden_dim)
         self.human_cvae_action_proj = nn.Linear(POSE_DIM, hidden_dim)  # always: encodes pose_actions (target), not an observation
-        if self.use_pose_observation:
-            self.human_cvae_state_proj = nn.Linear(POSE_DIM, hidden_dim)
-        else:
-            self.human_cvae_state_const = nn.Parameter(torch.zeros(hidden_dim))
         self.robot_cvae_state_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)
         self.robot_cvae_action_proj = nn.Linear(ROBOT_JOINT_DIM, hidden_dim)
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)
+        # Sized for the longest CVAE encoder sequence (robot/mixed: CLS + state
+        # + K action steps). Human's shorter sequence (CLS + K action steps,
+        # no state) reuses position 0 (CLS) and positions [2, 2+K) (action
+        # steps) from this same table — see _encode_latent — so the shared
+        # self.encoder sees the same position id for "first action step" in
+        # both cases, and only position 1 ("state") goes unused for human.
         self.register_buffer(
             "pos_table",
             get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim),
         )
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)
+        # Row 0 = latent token's position; row 1 = proprio token's position
+        # (robot/mixed only). Human uses only row 0.
         self.additional_pos_embed = nn.Embedding(2, hidden_dim)
 
     def _encode_latent(
         self,
         *,
-        pose_state: torch.Tensor,
         pose_actions: torch.Tensor,
         joint_state: torch.Tensor,
         joint_actions: torch.Tensor,
@@ -170,14 +171,16 @@ class MixedDETRVAE(nn.Module):
         embodiment: int,
     ):
         """
-        CVAE prior over [CLS, state, action_chunk].
+        CVAE prior over the encoder input sequence.
 
-        Robot / mixed path (EgoMimic): joints state + joint action chunk.
-        Human path: pose action chunk always; the state slot is either the
-        real pose_state (use_pose_observation=True) or a learned constant
-        that ignores pose_state entirely (default) — see module docstring.
+        Robot / mixed path (EgoMimic): [CLS, joint_state, joint_action_chunk].
+        Human path: [CLS, pose_action_chunk] — no state token at all (human has
+        no proprio observation; see module docstring), so the sequence is one
+        token shorter and reuses this module's pos_table at positions {0} u
+        {2, ..., 2+K-1}, skipping position 1 (the state slot robot/mixed use).
         """
         bs = is_pad.shape[0]
+        cls_embed = self.cls_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
         if embodiment in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED):
             if joint_state.shape[-1] != ROBOT_JOINT_DIM:
                 raise ValueError(f"joint_state must be [B,{ROBOT_JOINT_DIM}], got {tuple(joint_state.shape)}")
@@ -186,23 +189,20 @@ class MixedDETRVAE(nn.Module):
             state_embed = self.robot_cvae_state_proj(joint_state).unsqueeze(1)
             action_embed = self.robot_cvae_action_proj(joint_actions)
             device = joint_state.device
+            encoder_input = torch.cat([cls_embed, state_embed, action_embed], dim=1).permute(1, 0, 2)
+            is_pad_full = torch.cat([torch.full((bs, 2), False, device=device), is_pad], dim=1)
+            pos_embed = self.pos_table.clone().detach().permute(1, 0, 2)
         else:
             if pose_actions.shape[-1] != POSE_DIM:
                 raise ValueError(f"pose_actions must be [B,K,{POSE_DIM}], got {tuple(pose_actions.shape)}")
-            if self.use_pose_observation:
-                if pose_state.shape[-1] != POSE_DIM:
-                    raise ValueError(f"pose_state must be [B,{POSE_DIM}], got {tuple(pose_state.shape)}")
-                state_embed = self.human_cvae_state_proj(pose_state).unsqueeze(1)
-            else:
-                state_embed = self.human_cvae_state_const.view(1, 1, -1).expand(bs, 1, -1)
             action_embed = self.human_cvae_action_proj(pose_actions)
             device = pose_actions.device
+            encoder_input = torch.cat([cls_embed, action_embed], dim=1).permute(1, 0, 2)
+            is_pad_full = torch.cat([torch.full((bs, 1), False, device=device), is_pad], dim=1)
+            k = pose_actions.shape[1]
+            human_pos_table = torch.cat([self.pos_table[:, :1], self.pos_table[:, 2 : 2 + k]], dim=1)
+            pos_embed = human_pos_table.clone().detach().permute(1, 0, 2)
 
-        cls_embed = self.cls_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
-        encoder_input = torch.cat([cls_embed, state_embed, action_embed], dim=1).permute(1, 0, 2)
-        cls_state_pad = torch.full((bs, 2), False, device=device)
-        is_pad_full = torch.cat([cls_state_pad, is_pad], dim=1)
-        pos_embed = self.pos_table.clone().detach().permute(1, 0, 2)
         encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad_full)
         encoder_output = encoder_output[0]
         latent_info = self.latent_proj(encoder_output)
@@ -229,7 +229,13 @@ class MixedDETRVAE(nn.Module):
         Returns dict:
           pose_pred [B,K,8], joint_pred [B,K,14] or None for human,
           is_pad_pred [B,K,1], mu, logvar
+
+        pose_state is accepted for interface uniformity with the dataset batch
+        schema (and because HumanEpisodeDataset needs to compute it as the
+        pose_actions anchor) but is never read here — no embodiment feeds
+        pose_state into the model as an observation. See module docstring.
         """
+        del pose_state
         is_training = pose_actions is not None or joint_actions is not None
         bs = images.shape[0]
 
@@ -261,7 +267,6 @@ class MixedDETRVAE(nn.Module):
                     bs, self.num_queries, ROBOT_JOINT_DIM, device=images.device, dtype=images.dtype
                 )
             latent_input, mu, logvar = self._encode_latent(
-                pose_state=pose_state,
                 pose_actions=pose_actions,
                 joint_state=joint_state,
                 joint_actions=joint_actions,
@@ -299,18 +304,19 @@ class MixedDETRVAE(nn.Module):
         src = torch.cat(all_cam_features, dim=3)
         pos = torch.cat(all_cam_pos, dim=3)
 
-        # Modality routing (no embedding token)
+        # Modality routing (no embedding token). Robot/mixed get a real proprio
+        # token (joint_state); human has no proprio observation at all, so it
+        # contributes only the latent token — one fewer extra token than
+        # robot/mixed, not a placeholder standing in for a missing one.
         if embodiment_id in (EMBODIMENT_ROBOT, EMBODIMENT_MIXED):
             if joint_state.shape[-1] != ROBOT_JOINT_DIM:
                 raise ValueError(f"joint_state must be [B,{ROBOT_JOINT_DIM}], got {tuple(joint_state.shape)}")
             proprio_input = self.robot_input_proj(joint_state)
+            additional_inputs = [latent_input, proprio_input]
+            additional_pos_embed = self.additional_pos_embed.weight  # rows [latent, proprio]
         elif embodiment_id == EMBODIMENT_HUMAN:
-            if self.use_pose_observation:
-                if pose_state.shape[-1] != POSE_DIM:
-                    raise ValueError(f"pose_state must be [B,{POSE_DIM}], got {tuple(pose_state.shape)}")
-                proprio_input = self.human_input_proj(pose_state)
-            else:
-                proprio_input = self.human_input_const.view(1, -1).expand(bs, -1)
+            additional_inputs = [latent_input]
+            additional_pos_embed = self.additional_pos_embed.weight[:1]  # row [latent] only
         else:
             raise ValueError(f"Unknown embodiment id {embodiment_id}")
 
@@ -319,9 +325,8 @@ class MixedDETRVAE(nn.Module):
             None,
             self.query_embed.weight,
             pos,
-            latent_input,
-            proprio_input,
-            self.additional_pos_embed.weight,
+            additional_inputs,
+            additional_pos_embed,
         )[0]  # [B, K, H]
 
         # Shared pose head always; joint head for robot + mixed
@@ -365,7 +370,6 @@ def build(args):
         encoder,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
-        use_pose_observation=bool(getattr(args, "use_pose_observation", DEFAULT_USE_POSE_OBSERVATION)),
     )
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of parameters: %.2fM" % (n_parameters / 1e6,))

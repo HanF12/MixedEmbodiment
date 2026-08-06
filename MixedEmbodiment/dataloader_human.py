@@ -54,12 +54,11 @@ class HumanEpisodeDataset(Dataset):
       pose_actions[0] is zeros before normalization.
 
     pose_state is still computed here as the absolute hand pose at t (normalized
-    with absolute stats) — it is returned in the batch for logging / dataset
-    parity, but by default the model never actually uses it as an observation
-    (see core.py's `use_pose_observation`; the human proprio + CVAE state
-    channel are zeroed unless --pose_observation is passed). This dataset does
-    not need to know which mode is active: the masking happens entirely inside
-    the model.
+    with absolute stats) — it is returned in the batch as the anchor used to
+    build the relative pose_actions target, and for logging / dataset parity,
+    but the model never reads it as an observation: the human embodiment has
+    no proprio input at all (see core.py's module docstring). This dataset
+    does not need to know that: it just always computes pose_state.
 
     Common batch schema (joint_* are zeros; has_joint_target=False).
     """
