@@ -258,7 +258,7 @@ def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> Da
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=False,
         collate_fn=collate_homogeneous,
     )
@@ -654,6 +654,8 @@ def main() -> None:
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     print(f"Using device: {device}; active embodiments: {sorted(active)}")
     model = build(Args(cli.num_queries)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cli.lr, weight_decay=cli.weight_decay)

@@ -59,13 +59,13 @@ Checkpoints and `run_metadata.json` land in `MixedEmbodiment/weights/<run_name>/
 | Flag | Default | Notes |
 |---|---|---|
 | `-e`, `--epochs` | `10000` | One epoch = one full pass over the longest active-modality loader; shorter ones are recycled. |
-| `-b`, `--batch` | `8` | |
+| `-b`, `--batch` | `16` | |
 | `-q`, `--num_queries` | `45` | Action-chunk horizon K. |
 | `-g`, `--gpu_number` | `0` | Ignored if `--cpu`. |
 | `--cpu` | off | Force CPU even if a GPU is available. |
-| `--lr` | `1e-5` | |
+| `--lr` | `2e-5` | Linearly scaled with the default batch size (was `1e-5` @ batch 8). |
 | `--weight_decay` | `1e-4` | AdamW. |
-| `--num_workers` | `2` | DataLoader workers. |
+| `--num_workers` | `2` | DataLoader workers, per active modality loader. **Careful raising this without `--jpeg_in_ram`**: each worker is forked from a process holding the full raw-frame dataset in RAM as plain Python/numpy objects, and copy-on-write duplication across workers is easy to trigger — this is a shared machine. Safe to raise once `--jpeg_in_ram` is on (much smaller per-worker footprint). |
 | `--resize_factor` | `1.0` | Scale frames before encoding. |
 | `--jpeg_in_ram` | off | Store synced frames as JPEG bytes in RAM instead of raw arrays (much less host memory). |
 | `--jpeg_quality` | `90` | Only relevant with `--jpeg_in_ram`. |

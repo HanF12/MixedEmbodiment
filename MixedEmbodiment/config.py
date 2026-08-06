@@ -51,8 +51,8 @@ DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 DEFAULT_NUM_EPOCHS = 10000
 # One epoch = one full pass over the longest active-modality loader
 # (max over whichever of robot/human/mixed are active); shorter ones are recycled.
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_LR = 1e-5
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_LR = 2e-5  # linearly scaled from 1e-5 @ batch 8
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
