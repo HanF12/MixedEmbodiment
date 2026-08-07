@@ -20,9 +20,8 @@ Robot joints:
   load with a shared threshold (--gripper_binarize_threshold).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
-Human proprio: none. The human embodiment has no proprio observation at all —
-  no adapter, no placeholder token — and must predict relative pose purely
-  from video + the CVAE latent (see core.py module docstring).
+Human proprio: HARD-REMOVED — no adapter and no placeholder token; human must
+  predict relative pose purely from video + the CVAE latent (see core.py).
 
 Third modality (mixed):
   left_robot_right_hand + right_robot_left_hand are one modality (ConcatDataset).
@@ -52,13 +51,16 @@ DEFAULT_NUM_EPOCHS = 10000
 # One epoch = one full pass over the longest active-modality loader
 # (max over whichever of robot/human/mixed are active); shorter ones are recycled.
 DEFAULT_BATCH_SIZE = 16
-DEFAULT_LR = 2e-5  # linearly scaled from 1e-5 @ batch 8
+DEFAULT_LR = 2e-5  # linear scale from 1e-5 @ batch 8 → 2e-5 @ batch 16
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
-# Tunable mixed modality loss scale (also exposed as --mixed_lambda).
+# Fallback mixed modality loss scale when --mixed_lambda is given explicitly or
+# mixed is inactive. Training default is auto: mixed_batches / steps_per_epoch
+# (see training_combined.resolve_mixed_lambda) so recycled mixed demos contribute
+# the same total weight per epoch as seeing each mixed batch once.
 # L_mixed = mixed_lambda * (pose + joint + KL) before equal mean over modalities.
-DEFAULT_MIXED_LAMBDA = 0.1
+DEFAULT_MIXED_LAMBDA = 1.0
 DEFAULT_RECON_LOSS = "l1"
 # Gripper emphasis (the "gripweight" feature): scales per-element recon error on
 # gripper dims of both the shared pose head and the robot/mixed joint head.
@@ -72,11 +74,9 @@ DEFAULT_GRIPPER_LOSS_WEIGHT = 5.0
 ACTION_CHUNK_STARTS_AT_CURRENT = True
 POSE_ACTION_RELATIVE_TO_CHUNK_ANCHOR = True
 
-# No embodiment ever receives absolute pose as an observation. Robot/mixed
-# proprio is always joint_state; human has no proprio observation at all —
-# only images + the CVAE latent drive the prediction, and the model is scored
-# purely on how well it predicts the *relative* pose chunk. See core.py's
-# module docstring for the (now removed) legacy --pose_observation history.
+# Human proprio observation is hard-removed in this package (no --pose_observation
+# flag): the model never constructs human_input_proj / human_cvae_state_proj and
+# never inserts a proprio token for the human embodiment. See core.py.
 
 # --- Robot joints ---
 ROBOT_JOINT_DIM = 14
@@ -476,10 +476,9 @@ def build_run_metadata(
         "pose_action_space": "relative_to_chunk_anchor",
         "pose_observation": False,
         "pose_observation_semantics": (
-            "No embodiment ever receives absolute pose as an observation. Human "
-            "has no proprio observation at all (no adapter, no placeholder "
-            "token) and predicts the relative pose chunk from images + latent "
-            "only. Robot/mixed proprio is always joint_state."
+            "Hard-removed: human has no proprio observation at all (no adapter, "
+            "no placeholder token) and predicts the relative pose chunk from "
+            "images + latent only. Robot/mixed proprio is always joint_state."
         ),
         "embodiment_cue": "modality routing (separate projs/heads/cams), no embedding token",
         "mixed_policy": (

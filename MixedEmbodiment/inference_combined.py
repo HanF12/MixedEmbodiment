@@ -9,7 +9,7 @@ but drives MixedEmbodiment.MixedDETRVAE with:
   - camera slots [bird, left_wrist, right_wrist] (true 3-cam; no front)
   - shared pose head is xyz+gripper (8D); control from joint_action_head only
   - MixedEmbodiment training also has human/mixed modalities; this script uses
-    the robot joint path only (no embodiment ever observes absolute pose)
+    the robot joint path only (human proprio hard-removed in this package; robot path unaffected)
 
 Relative vs absolute
 --------------------

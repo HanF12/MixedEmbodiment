@@ -17,10 +17,8 @@ and MixedEmbodiment_gripweight packages.
   packages
 - Gripper emphasis ("gripweight"): --gripper_loss_weight scales recon error on
   pose grip dims (3,7) and joint grip dims (6,13); default 5.0
-- No embodiment ever observes absolute pose: robot/mixed proprio is always
-  joint_state, and the human embodiment has no proprio observation at all
-  (predicts the relative pose chunk from images + CVAE latent only); see
-  core.py's module docstring.
+- Human proprio: hard-removed (no adapter / no placeholder token); human predicts
+  relative pose from images + CVAE latent only; see core.py
 """
 
 from __future__ import annotations
@@ -123,6 +121,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--output_dir", type=str, default=None)
+    p.add_argument(
+        "--weights_on_home",
+        action="store_true",
+        help=(
+            "Save checkpoints under <package>/weights_home/ on the /home filesystem "
+            "(real directory, not the weights/ symlink to /data). Ignored if --output_dir is set. "
+            "Default without this flag: /data/hfang09/<package>/weights."
+        ),
+    )
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("-e", "--epochs", type=int, default=DEFAULT_NUM_EPOCHS)
     p.add_argument("-b", "--batch", type=int, default=DEFAULT_BATCH_SIZE)
@@ -157,6 +164,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--jpeg_quality", type=int, default=90)
     p.add_argument("--max_sync_rows", type=int, default=None, help="Cap synced rows per demo (debug/smoke).")
     p.add_argument("--save_every_epochs", type=int, default=1000)
+    p.add_argument(
+        "--save_after_epochs",
+        type=int,
+        default=4000,
+        help="Only start saving checkpoints (best + periodic) after this many epochs.",
+    )
     p.add_argument("--pose_loss_weight", type=float, default=1.0)
     p.add_argument("--joint_loss_weight", type=float, default=1.0)
     p.add_argument(
@@ -171,7 +184,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
     p.add_argument("--hand_lambda", type=float, default=DEFAULT_HAND_LAMBDA, help="Human loss scale (EgoMimic).")
-    p.add_argument("--mixed_lambda", type=float, default=DEFAULT_MIXED_LAMBDA, help="Mixed loss scale.")
+    p.add_argument(
+        "--mixed_lambda",
+        type=float,
+        default=None,
+        help=(
+            "Mixed loss scale. Default (omit): auto = len(mixed_loader) / steps_per_epoch, "
+            "so each mixed batch's total weight per epoch matches one pass without recycling "
+            "(recycle count * lambda = 1). Pass an explicit float to override "
+            f"(legacy unweighted was {DEFAULT_MIXED_LAMBDA})."
+        ),
+    )
     p.add_argument(
         "--gripper_binarize_threshold",
         type=float,
@@ -253,13 +276,15 @@ def parse_embodiments(spec: str) -> set[str]:
 
 
 def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
+    # persistent_workers keeps workers alive across iter() restarts (short robot
+    # loader recycles often). pin_memory + non_blocking .to() overlap H2D with compute.
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=False,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(num_workers > 0),
         collate_fn=collate_homogeneous,
     )
 
@@ -318,18 +343,18 @@ def compute_batch_losses(
       robot: pose_recon + joint_recon + kl
     Gripper dims in pose/joint actions are scaled by gripper_w inside recon.
     """
-    pose_state = batch["pose_state"].to(device)
-    joint_state = batch["joint_state"].to(device)
-    images = batch["images"].to(device)
-    pose_actions = batch["pose_actions"].to(device)
-    joint_actions = batch["joint_actions"].to(device)
-    is_pad = batch["is_pad"].to(device)
-    camera_mask = batch["camera_mask"].to(device)
+    pose_state = batch["pose_state"].to(device, non_blocking=True)
+    joint_state = batch["joint_state"].to(device, non_blocking=True)
+    images = batch["images"].to(device, non_blocking=True)
+    pose_actions = batch["pose_actions"].to(device, non_blocking=True)
+    joint_actions = batch["joint_actions"].to(device, non_blocking=True)
+    is_pad = batch["is_pad"].to(device, non_blocking=True)
+    camera_mask = batch["camera_mask"].to(device, non_blocking=True)
     embodiment = int(batch["embodiment"])
     has_joint = bool(batch["has_joint_target"])
     joint_dim_mask = batch.get("joint_loss_mask")
     if joint_dim_mask is not None:
-        joint_dim_mask = joint_dim_mask.to(device)
+        joint_dim_mask = joint_dim_mask.to(device, non_blocking=True)
 
     out = model(
         pose_state=pose_state,
@@ -446,6 +471,26 @@ def next_batch_recycling(loader_iter, loader):
         return next(loader_iter), loader_iter
 
 
+def resolve_mixed_lambda(
+    mixed_loader,
+    steps_per_epoch: int,
+    explicit: float | None,
+) -> tuple[float, bool]:
+    """
+    Resolve mixed_lambda.
+
+    Auto (explicit is None): len(mixed_loader) / steps_per_epoch.
+    With recycling, each mixed batch is visited ~steps/N_m times per epoch; scaling
+    by N_m/steps makes the cumulative weight per mixed batch equal to 1 — same as
+    seeing each mixed batch once with lambda=1 and no recycle.
+    """
+    if explicit is not None:
+        return float(explicit), False
+    if mixed_loader is None or steps_per_epoch <= 0:
+        return float(DEFAULT_MIXED_LAMBDA), True
+    return float(len(mixed_loader)) / float(steps_per_epoch), True
+
+
 def steps_per_epoch_from_loaders(*loaders) -> int:
     lengths = [len(loader) for loader in loaders if loader is not None]
     return max(1, max(lengths)) if lengths else 1
@@ -476,22 +521,30 @@ def main() -> None:
             "left_robot_right_hand|right_robot_left_hand/<date>."
         )
 
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    if cli.output_dir:
+        weights_root = Path(cli.output_dir).expanduser().resolve()
+    elif cli.weights_on_home:
+        # Real dir on /home — do not use pkg/weights (that is a symlink to /data).
+        weights_root = (pkg / "weights_home").resolve()
+    else:
+        weights_root = Path(f"/data/hfang09/{pkg.name}/weights")
     run_name = cli.run_name or default_run_name()
     output_dir = weights_root / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints -> {output_dir}")
 
     # Per-run sync tree avoids mushing CSVs across sessions_root / prior runs.
     sync_root = pkg / "m-synced-csvs" / run_name
 
     gripper_thr = float(cli.gripper_binarize_threshold)
+    # mixed_lambda filled after loaders exist (may be auto from recycle ratio).
     loss_cfg = {
         "pose_w": float(cli.pose_loss_weight),
         "joint_w": float(cli.joint_loss_weight),
         "kl_w": float(cli.kl_weight),
         "recon_kind": str(cli.reconstruction_loss),
         "hand_lambda": float(cli.hand_lambda),
-        "mixed_lambda": float(cli.mixed_lambda),
+        "mixed_lambda": float(DEFAULT_MIXED_LAMBDA),
         "gripper_w": float(cli.gripper_loss_weight),
     }
 
@@ -645,7 +698,7 @@ def main() -> None:
         reconstruction_loss=cli.reconstruction_loss,
         joint_modality_update=cli.joint_modality_update,
         hand_lambda=cli.hand_lambda,
-        mixed_lambda=cli.mixed_lambda,
+        mixed_lambda=DEFAULT_MIXED_LAMBDA,  # overwritten below after auto-resolve
         num_epochs=cli.epochs,
         batch_size=cli.batch,
         lr=cli.lr,
@@ -654,9 +707,7 @@ def main() -> None:
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    print(f"Using device: {device}; active embodiments: {sorted(active)}")
+    print(f"Using device: {device}; active embodiments: {sorted(active)}; human_proprio=hard_removed")
     model = build(Args(cli.num_queries)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cli.lr, weight_decay=cli.weight_decay)
     use_amp = device.type == "cuda"
@@ -667,6 +718,11 @@ def main() -> None:
     mixed_loader = make_loader(mixed_ds, cli.batch, cli.num_workers, shuffle=True) if mixed_ds is not None else None
     active_loaders = [l for l in (robot_loader, human_loader, mixed_loader) if l is not None]
     steps_per_epoch = steps_per_epoch_from_loaders(*active_loaders)
+    mixed_lambda, mixed_lambda_auto = resolve_mixed_lambda(mixed_loader, steps_per_epoch, cli.mixed_lambda)
+    cli.mixed_lambda = mixed_lambda
+    loss_cfg["mixed_lambda"] = mixed_lambda
+    meta["mixed_lambda"] = mixed_lambda
+    meta["mixed_lambda_auto"] = bool(mixed_lambda_auto)
     meta["steps_per_epoch"] = int(steps_per_epoch)
     if robot_loader is not None:
         meta["robot_loader_batches"] = len(robot_loader)
@@ -677,6 +733,14 @@ def main() -> None:
     if mixed_loader is not None:
         meta["mixed_loader_batches"] = len(mixed_loader)
         meta["mixed_num_demos"] = len(mixed_ds)
+        if mixed_lambda_auto:
+            print(
+                f"mixed_lambda auto={mixed_lambda:.6g} "
+                f"(= mixed_batches/steps_per_epoch = {len(mixed_loader)}/{steps_per_epoch}; "
+                f"equiv. to one pass over mixed without recycling)"
+            )
+        else:
+            print(f"mixed_lambda={mixed_lambda:.6g} (explicit)")
     save_run_metadata(output_dir, meta)
 
     if cli.dry_run:
@@ -824,12 +888,13 @@ def main() -> None:
                 step=step,
             )
 
-        if avg < best:
-            best = avg
-            torch.save(model.state_dict(), output_dir / "mixed_act_best.pth")
-            print(f"Saved new best -> {output_dir / 'mixed_act_best.pth'}")
-        if cli.save_every_epochs > 0 and (epoch + 1) % cli.save_every_epochs == 0:
-            torch.save(model.state_dict(), output_dir / f"mixed_act_epoch_{epoch+1}.pth")
+        if (epoch + 1) >= cli.save_after_epochs:
+            if avg < best:
+                best = avg
+                torch.save(model.state_dict(), output_dir / "mixed_act_best.pth")
+                print(f"Saved new best -> {output_dir / 'mixed_act_best.pth'}")
+            if cli.save_every_epochs > 0 and (epoch + 1) % cli.save_every_epochs == 0:
+                torch.save(model.state_dict(), output_dir / f"mixed_act_epoch_{epoch+1}.pth")
 
     if wandb_run is not None:
         wandb.finish()

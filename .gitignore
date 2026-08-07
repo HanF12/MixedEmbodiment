@@ -18,6 +18,7 @@ sessions/
 
 # Model artifacts
 weights/
+weights_home/
 ALOHA-mimic/weights*/
 *.pth
 *.npz
