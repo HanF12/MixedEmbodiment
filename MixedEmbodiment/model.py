@@ -174,7 +174,9 @@ class Transformer(nn.Module):
             # flatten NxCxHxW to HWxNxC
             bs, c, h, w = src.shape
             src = src.flatten(2).permute(2, 0, 1)
-            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+            pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+            if pos_embed.shape[1] == 1 and bs != 1:
+                pos_embed = pos_embed.repeat(1, bs, 1)
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             # mask = mask.flatten(1)
 
