@@ -296,8 +296,7 @@ class MixedDETRVAE(nn.Module):
             feat = self.input_proj(features)
             m = camera_mask[:, cam_id].view(bs, 1, 1, 1)
             feat = feat * m
-            # Keep pos batchless [1,C,h,w]; scale with homogeneous mask scalar.
-            pos = pos * camera_mask[0, cam_id].view(1, 1, 1, 1)
+            pos = pos.expand(bs, -1, -1, -1) * m
             all_cam_features.append(feat)
             all_cam_pos.append(pos)
 
