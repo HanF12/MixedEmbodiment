@@ -33,8 +33,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from MixedEmbodiment.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR  # noqa: E402
-from MixedEmbodiment.dataloader_utils import (  # noqa: E402
+from MixedEmbodiment_4cam.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR  # noqa: E402
+from MixedEmbodiment_4cam.dataloader_utils import (  # noqa: E402
     demo_id_from_hash_filename,
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,

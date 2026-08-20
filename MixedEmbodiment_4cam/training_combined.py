@@ -3,7 +3,7 @@ MixedEmbodiment ACT training — one CLI, three selectable modalities
 (robot / human / mixed), replacing the separate Combined_relative_3cam_gripweight
 and MixedEmbodiment_gripweight packages.
 
-- True 3-camera architecture: [bird, left_wrist, right_wrist] (no front model slot)
+- True 4-camera architecture: [bird, left_wrist, right_wrist, front]
 - Pose = xyz+gripper only (8D); rot6d dropped at load
 - Pose actions relative to chunk anchor; joint actions absolute
 - Shared pose head (human primary + robot/mixed aux); robot/mixed-only joint head
@@ -46,7 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from MixedEmbodiment.config import (  # noqa: E402
+from MixedEmbodiment_4cam.config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
     DEFAULT_GRIPPER_LOSS_WEIGHT,
     DEFAULT_HAND_LAMBDA,
@@ -75,8 +75,8 @@ from MixedEmbodiment.config import (  # noqa: E402
     gripper_dim_weights,
     save_run_metadata,
 )
-from MixedEmbodiment.core import build, kl_divergence  # noqa: E402
-from MixedEmbodiment.data_synchronization import (  # noqa: E402
+from MixedEmbodiment_4cam.core import build, kl_divergence  # noqa: E402
+from MixedEmbodiment_4cam.data_synchronization import (  # noqa: E402
     build_human_sync_csvs,
     build_mixed_sync_csvs,
     build_robot_sync_csvs,
@@ -84,12 +84,12 @@ from MixedEmbodiment.data_synchronization import (  # noqa: E402
     resolve_human_pose_dir,
     resolve_robot_eef_dir,
 )
-from MixedEmbodiment.dataloader_human import HumanEpisodeDataset, collate_homogeneous  # noqa: E402
-from MixedEmbodiment.dataloader_mixed import (  # noqa: E402
+from MixedEmbodiment_4cam.dataloader_human import HumanEpisodeDataset, collate_homogeneous  # noqa: E402
+from MixedEmbodiment_4cam.dataloader_mixed import (  # noqa: E402
     ConcatMixedEpisodeDataset,
     MixedEpisodeDataset,
 )
-from MixedEmbodiment.dataloader_robot import RobotEpisodeDataset  # noqa: E402
+from MixedEmbodiment_4cam.dataloader_robot import RobotEpisodeDataset  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -707,6 +707,7 @@ def main() -> None:
             child = MixedEpisodeDataset(
                 bird_vids_dir=mixed_root / "bird-realsense-data" / "mp4",
                 wrist_vids_dir=mixed_root / "aloha-data" / robot_side / "mp4",
+                front_vids_dir=mixed_root / "front-realsense-data" / "mp4",
                 joint_data_dir=mixed_root / "joint-data" / robot_side / "position",
                 hand_pose_npz_dir=mixed_pose_dir,
                 eef_pose_data_dir=mixed_eef_dir,
