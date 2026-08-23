@@ -155,6 +155,15 @@ def parse_args() -> argparse.Namespace:
         help="Use only the first N robot demos (sorted demo IDs). None = all.",
     )
     p.add_argument(
+        "--robot_sample_from_first_m",
+        type=int,
+        default=None,
+        help=(
+            "Robot only: when --robot_max_demos=N is set, sample those N demos without replacement "
+            "from the first M sorted robot demos, using --seed for determinism."
+        ),
+    )
+    p.add_argument(
         "--human_max_demos", type=int, default=None,
         help="Use only the first N human demos (sorted demo IDs). None = all.",
     )
@@ -614,7 +623,8 @@ def main() -> None:
     if robot_root is not None:
         robot_eef_dir = resolve_robot_eef_dir(robot_root)
         robot_sync = sync_root / f"{robot_root.name}_robot"
-        build_robot_sync_csvs(robot_root, robot_sync, robot_eef_dir, cli.max_skew_s, cli.robot_max_demos)
+        robot_sync_cap = cli.robot_sample_from_first_m if cli.robot_sample_from_first_m is not None else cli.robot_max_demos
+        build_robot_sync_csvs(robot_root, robot_sync, robot_eef_dir, cli.max_skew_s, robot_sync_cap)
         robot_ds = RobotEpisodeDataset(
             bird_vids_dir=robot_root / "bird-realsense-data" / "mp4",
             front_vids_dir=robot_root / "front-realsense-data" / "mp4",
@@ -626,6 +636,8 @@ def main() -> None:
             sync_csv_dir=robot_sync,
             num_queries=cli.num_queries,
             max_demos=cli.robot_max_demos,
+            sample_max_demos_from_first=cli.robot_sample_from_first_m,
+            selection_seed=cli.seed,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
             jpeg_in_ram=cli.jpeg_in_ram,
@@ -783,6 +795,9 @@ def main() -> None:
     )
     meta["jpeg_in_ram"] = bool(cli.jpeg_in_ram)
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
+    meta["robot_sample_from_first_m"] = (
+        int(cli.robot_sample_from_first_m) if cli.robot_sample_from_first_m is not None else None
+    )
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
     print(f"Using device: {device}; active embodiments: {sorted(active)}; human_proprio=hard_removed")

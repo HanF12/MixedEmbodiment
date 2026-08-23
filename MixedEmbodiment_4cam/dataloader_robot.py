@@ -80,6 +80,8 @@ class RobotEpisodeDataset(Dataset):
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
+        sample_max_demos_from_first: int | None = None,
+        selection_seed: int | None = None,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
@@ -107,10 +109,33 @@ class RobotEpisodeDataset(Dataset):
         right_joints = sorted(resolve_path(right_joint_data_dir).glob("*.npy"))
         eef_files = sorted(resolve_path(eef_pose_data_dir).glob("*.npz"))
         sync_csvs = sorted(resolve_path(sync_csv_dir).glob("*.csv"))
-        if max_demos is not None and max_demos > 0:
+        if sample_max_demos_from_first is not None:
+            if sample_max_demos_from_first <= 0:
+                raise ValueError("sample_max_demos_from_first must be > 0 when provided")
+            if max_demos is None or max_demos <= 0:
+                raise ValueError("sample_max_demos_from_first requires max_demos to also be set")
+            if max_demos > sample_max_demos_from_first:
+                raise ValueError(
+                    f"Cannot sample max_demos={max_demos} from first {sample_max_demos_from_first} robot demos"
+                )
+            pool = sync_csvs[:sample_max_demos_from_first]
+            if len(pool) < max_demos:
+                raise ValueError(
+                    f"Requested max_demos={max_demos} from first {sample_max_demos_from_first}, "
+                    f"but only {len(pool)} robot sync CSVs are available"
+                )
+            rng = np.random.default_rng(selection_seed)
+            keep_idx = np.sort(rng.choice(len(pool), size=max_demos, replace=False))
+            sync_csvs = [pool[int(i)] for i in keep_idx]
+            print(
+                f"Robot dataset: sampled {max_demos} demos from first {sample_max_demos_from_first} "
+                f"(seed={selection_seed})"
+            )
+        elif max_demos is not None and max_demos > 0:
             sync_csvs = sync_csvs[:max_demos]
         if not sync_csvs:
             raise FileNotFoundError(f"No robot sync CSVs in {sync_csv_dir}")
+        self.selected_demo_ids = [p.stem for p in sync_csvs]
 
         bird_by = index_paths_by_demo_id(bird_vids, demo_id_from_hash_filename)
         front_by = index_paths_by_demo_id(front_vids, demo_id_from_hash_filename)
