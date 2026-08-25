@@ -1072,6 +1072,7 @@ def main() -> None:
             )
             child = MixedEpisodeDataset(
                 bird_vids_dir=mixed_root / "bird-realsense-data" / "mp4",
+                front_vids_dir=mixed_root / "front-realsense-data" / "mp4",
                 wrist_vids_dir=mixed_root / "aloha-data" / robot_side / "mp4",
                 joint_data_dir=mixed_root / "joint-data" / robot_side / "position",
                 hand_pose_npz_dir=mixed_pose_dir,
