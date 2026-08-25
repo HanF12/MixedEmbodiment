@@ -60,6 +60,7 @@ from MixedEmbodiment.config import (  # noqa: E402
     concat_bimanual_joints,
     load_run_metadata,
     stack_camera_tensors,
+    unwrap_model_state_dict,
     validate_run_metadata,
 )
 from MixedEmbodiment.core import build  # noqa: E402
@@ -300,7 +301,8 @@ if metadata is not None:
         print(f"Warning: skipping run_metadata validation: {exc}")
 
 model = build(Args(cli.num_queries)).to(device)
-state_dict = torch.load(str(checkpoint_path), map_location=device)
+checkpoint_payload = torch.load(str(checkpoint_path), map_location=device)
+state_dict = unwrap_model_state_dict(checkpoint_payload)
 model.load_state_dict(state_dict)
 model.eval()
 print(f"Loaded checkpoint: {checkpoint_path}")

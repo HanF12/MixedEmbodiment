@@ -1,7 +1,7 @@
 """
 MixedEmbodiment ACT constants and helpers.
 
-One package, three CLI-selectable modalities (robot / human / mixed), replacing
+One package, CLI-selectable modalities (any subset of robot / human / mixed), replacing
 the separate Combined_relative_3cam_gripweight and MixedEmbodiment_gripweight
 folders. Architecture and conventions are unchanged from those two packages:
 
@@ -560,6 +560,13 @@ def load_run_metadata(run_dir: str | Path) -> dict[str, Any] | None:
     if not metadata_path.exists():
         return None
     return json.loads(metadata_path.read_text())
+
+
+def unwrap_model_state_dict(payload: object) -> object:
+    """Accept full training-state checkpoints or a raw model state_dict."""
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"]
+    return payload
 
 
 def validate_run_metadata(metadata: dict[str, Any], *, num_queries: int | None = None) -> None:

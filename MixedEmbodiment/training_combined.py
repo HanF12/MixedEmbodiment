@@ -8,10 +8,14 @@ and MixedEmbodiment_gripweight packages.
 - Pose actions relative to chunk anchor; joint actions absolute
 - Shared pose head (human primary + robot/mixed aux); robot/mixed-only joint head
 - Modality routing (no embodiment embedding)
-- Input is always a `sessions/<kind>/<date>/...` tree (--sessions_root); which of
-  the three modalities to train on is chosen with --embodiments, and how many
-  demos to use from each is independently controlled with
-  --robot_max_demos / --human_max_demos / --mixed_max_demos
+- Input is always a `sessions/<kind>/<date>/...` tree (--sessions_root); which
+  modalities to train on is any subset of robot/human/mixed via --embodiments
+  (e.g. 'human' or 'robot,mixed'), and how many demos to use from each is
+  independently controlled with --robot_max_demos / --human_max_demos /
+  --mixed_max_demos
+- Resume: --resume_from loads a checkpoint. Matching full training-state
+  checkpoints continue optimizer/scaler/epoch/RNG exactly; a different
+  embodiment set (or --resume_weights_only) warm-starts from model weights.
 - Schedule: each epoch = one full pass over the longest active-modality loader
   (shorter ones recycled); batch/lr/recon/kl defaults match the two predecessor
   packages
@@ -27,6 +31,7 @@ import argparse
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -92,7 +97,7 @@ from MixedEmbodiment.dataloader_mixed import (  # noqa: E402
 from MixedEmbodiment.dataloader_robot import RobotEpisodeDataset  # noqa: E402
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="MixedEmbodiment ACT training (robot / human / mixed, one CLI)"
     )
@@ -102,7 +107,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Global RNG seed for Python/NumPy/PyTorch (+ CUDA if available) and DataLoader "
-            "shuffling/worker seeding. Omit for default nondeterministic behavior."
+            "shuffling/worker seeding. If omitted, one is auto-generated and saved so "
+            "future resume checkpoints can continue exactly."
         ),
     )
     p.add_argument(
@@ -121,13 +127,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="robot,human,mixed",
         help=(
-            "Which of the three predecessor training regimes to run: 'robot' "
-            "(matches Bimanual-3cam), 'robot,human' (matches "
-            "Combined_relative_3cam_gripweight), or 'robot,human,mixed' (matches "
-            "MixedEmbodiment_gripweight, the default). No other combination is "
-            "accepted — robot is always the anchor, and mixed requires human. A "
-            "requested modality that isn't found under --sessions_root is skipped "
-            "with a warning; training fails only if zero modalities end up active."
+            "Comma-separated subset of robot,human,mixed to train on. Examples: "
+            "'human', 'robot,mixed', 'robot,human,mixed' (default). A requested "
+            "modality that isn't found under --sessions_root is skipped with a warning; "
+            "training fails only if zero modalities end up active."
+        ),
+    )
+    p.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help=(
+            "Checkpoint to resume or warm-start from. Full training-state checkpoints "
+            "resume optimizer/scaler/epoch/RNG exactly when compatible; flags you omit "
+            "are inherited from the checkpoint. Plain model state_dict checkpoints "
+            "(and --resume_weights_only / a different --embodiments set) load model "
+            "weights only. Raise --epochs above the completed epoch count to continue."
+        ),
+    )
+    p.add_argument(
+        "--resume_weights_only",
+        action="store_true",
+        help=(
+            "Load model weights from --resume_from but start a new optimizer/scaler/"
+            "epoch/RNG schedule (use this to fine-tune a checkpoint on a new embodiment set)."
         ),
     )
     p.add_argument("--output_dir", type=str, default=None)
@@ -166,6 +189,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--human_max_demos", type=int, default=None,
         help="Use only the first N human demos (sorted demo IDs). None = all.",
+    )
+    p.add_argument(
+        "--human_sample_from_first_m",
+        type=int,
+        default=None,
+        help=(
+            "Human only: when --human_max_demos=N is set, sample those N demos without replacement "
+            "from the first M sorted human demos, using --seed for determinism."
+        ),
     )
     p.add_argument(
         "--mixed_max_demos", type=int, default=None,
@@ -242,7 +274,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sync, load one batch per active modality, run one train step each, then exit.",
     )
-    return p.parse_args()
+    return p
+
+
+def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
+    parser = build_arg_parser()
+    return parser.parse_args(), parser
 
 
 class Args:
@@ -263,17 +300,37 @@ class Args:
         self.dilation = False
 
 
-# The only three supported combinations, matching the three predecessor folders
-# exactly: Bimanual-3cam (robot alone — different model class, but this is the
-# nearest equivalent run within this architecture), Combined_relative_3cam_gripweight
-# (robot+human, always required together), and MixedEmbodiment_gripweight
-# (robot+human+mixed). robot is always the anchor; mixed requires human. There is
-# no human-alone, mixed-alone, or human+mixed-without-robot mode — those never
-# existed in any predecessor and aren't validated against one.
-VALID_EMBODIMENT_SETS = (
-    frozenset({"robot"}),
-    frozenset({"robot", "human"}),
-    frozenset({"robot", "human", "mixed"}),
+RESUME_CHECKPOINT_VERSION = 1
+EPOCH_SEED_STRIDE = 10_000
+MODALITY_SEED_OFFSETS = {"robot": 0, "human": 1, "mixed": 2}
+EXACT_RESUME_COMPARE_KEYS = (
+    "embodiments",
+    "sessions_root",
+    "seed",
+    "num_queries",
+    "batch",
+    "num_workers",
+    "lr",
+    "weight_decay",
+    "max_skew_s",
+    "robot_max_demos",
+    "robot_sample_from_first_m",
+    "human_max_demos",
+    "human_sample_from_first_m",
+    "mixed_max_demos",
+    "resize_factor",
+    "jpeg_in_ram",
+    "jpeg_quality",
+    "max_sync_rows",
+    "pose_loss_weight",
+    "joint_loss_weight",
+    "gripper_loss_weight",
+    "kl_weight",
+    "hand_lambda",
+    "mixed_lambda",
+    "gripper_binarize_threshold",
+    "reconstruction_loss",
+    "joint_modality_update",
 )
 
 
@@ -284,14 +341,129 @@ def parse_embodiments(spec: str) -> set[str]:
         raise ValueError(f"Unknown --embodiments entries {sorted(unknown)}; choose from {EMBODIMENT_NAMES}")
     if not requested:
         raise ValueError("--embodiments must name at least one of robot,human,mixed")
-    if frozenset(requested) not in VALID_EMBODIMENT_SETS:
-        raise ValueError(
-            f"--embodiments={sorted(requested)} is not supported. Only robot / "
-            "robot,human / robot,human,mixed are supported (matching Bimanual-3cam / "
-            "Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight respectively) "
-            "— robot is always the anchor, and mixed requires human."
-        )
     return requested
+
+
+def resolve_existing_path(path_like: str) -> Path:
+    path = Path(path_like).expanduser()
+    return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
+
+
+def _normalize_resume_value(key: str, value: Any) -> Any:
+    if key == "embodiments":
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return tuple(sorted(parse_embodiments(value)))
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return tuple(sorted(str(v) for v in value))
+    if key == "sessions_root":
+        if value is None:
+            return None
+        return str(Path(value).expanduser().resolve())
+    if key in {
+        "seed",
+        "num_queries",
+        "batch",
+        "num_workers",
+        "robot_max_demos",
+        "robot_sample_from_first_m",
+        "human_max_demos",
+        "human_sample_from_first_m",
+        "mixed_max_demos",
+        "jpeg_quality",
+        "max_sync_rows",
+    }:
+        return None if value is None else int(value)
+    if key in {
+        "lr",
+        "weight_decay",
+        "max_skew_s",
+        "resize_factor",
+        "pose_loss_weight",
+        "joint_loss_weight",
+        "gripper_loss_weight",
+        "kl_weight",
+        "hand_lambda",
+        "mixed_lambda",
+        "gripper_binarize_threshold",
+    }:
+        return None if value is None else float(value)
+    if key in {"jpeg_in_ram", "joint_modality_update"}:
+        return bool(value)
+    return value
+
+
+def exact_resume_mismatches(saved_cli: dict[str, Any], current_cli: argparse.Namespace) -> list[str]:
+    current = vars(current_cli)
+    mismatches: list[str] = []
+    for key in EXACT_RESUME_COMPARE_KEYS:
+        saved_value = _normalize_resume_value(key, saved_cli.get(key))
+        current_value = _normalize_resume_value(key, current.get(key))
+        if saved_value != current_value:
+            mismatches.append(f"{key}: saved={saved_value!r} current={current_value!r}")
+    return mismatches
+
+
+def explicit_cli_dests(parser: argparse.ArgumentParser, argv: list[str] | None = None) -> set[str]:
+    """Return argparse dest names that were present on the command line."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        for opt in action.option_strings:
+            option_to_dest[opt] = action.dest
+    explicit: set[str] = set()
+    for tok in argv:
+        if tok == "--":
+            break
+        name = tok.split("=", 1)[0]
+        if name in option_to_dest:
+            explicit.add(option_to_dest[name])
+    return explicit
+
+
+def inherit_unspecified_cli(cli: argparse.Namespace, saved_cli: dict[str, Any], explicit: set[str]) -> list[str]:
+    """Copy checkpoint CLI values for flags the user did not pass this run."""
+    inherited: list[str] = []
+    for key in EXACT_RESUME_COMPARE_KEYS:
+        if key in explicit or key not in saved_cli:
+            continue
+        setattr(cli, key, saved_cli[key])
+        inherited.append(key)
+    return inherited
+
+
+def is_full_training_checkpoint(payload: object) -> bool:
+    return isinstance(payload, dict) and "model_state_dict" in payload and "optimizer_state_dict" in payload
+
+
+def atomic_torch_save(obj: object, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
+def move_optimizer_state_to_device(optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def shutdown_loader(loader: DataLoader | None) -> None:
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception:
+            pass
 
 
 def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
@@ -344,6 +516,119 @@ def make_loader_seeded(
         worker_init_fn=_seed_worker,
         generator=g,
     )
+
+
+def seed_for_epoch(base_seed: int, *, epoch: int, modality: str) -> int:
+    return int(base_seed) + int(epoch) * EPOCH_SEED_STRIDE + MODALITY_SEED_OFFSETS[modality]
+
+
+def build_epoch_loaders(
+    *,
+    robot_ds,
+    human_ds,
+    mixed_ds,
+    batch_size: int,
+    num_workers: int,
+    base_seed: int,
+    epoch: int,
+) -> tuple[DataLoader | None, DataLoader | None, DataLoader | None]:
+    robot_loader = (
+        make_loader_seeded(
+            robot_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=True,
+            seed=seed_for_epoch(base_seed, epoch=epoch, modality="robot"),
+        )
+        if robot_ds is not None
+        else None
+    )
+    human_loader = (
+        make_loader_seeded(
+            human_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=True,
+            seed=seed_for_epoch(base_seed, epoch=epoch, modality="human"),
+        )
+        if human_ds is not None
+        else None
+    )
+    mixed_loader = (
+        make_loader_seeded(
+            mixed_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=True,
+            seed=seed_for_epoch(base_seed, epoch=epoch, modality="mixed"),
+        )
+        if mixed_ds is not None
+        else None
+    )
+    return robot_loader, human_loader, mixed_loader
+
+
+def capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state and state["cuda"] is not None:
+        try:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        except Exception as exc:
+            print(f"Warning: could not restore CUDA RNG state ({exc})")
+
+
+def save_model_weights(model, path: Path) -> None:
+    torch.save(model.state_dict(), path)
+
+
+def save_resume_checkpoint(
+    *,
+    path: Path,
+    model,
+    optimizer,
+    scaler,
+    cli: argparse.Namespace,
+    active: set[str],
+    meta: dict[str, Any],
+    epoch: int,
+    step: int,
+    best: float,
+    exact_resume_compatible: bool,
+) -> None:
+    payload = {
+        "checkpoint_type": "mixed_embodiment_training_state",
+        "checkpoint_version": RESUME_CHECKPOINT_VERSION,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "cli_args": dict(vars(cli)),
+        "active_embodiments": sorted(active),
+        "run_metadata": meta,
+        "next_epoch": int(epoch),
+        "global_step": int(step),
+        "best": float(best),
+        "rng_state": capture_rng_state(),
+        "exact_resume_compatible": bool(exact_resume_compatible),
+    }
+    atomic_torch_save(payload, path)
 
 
 def masked_recon_loss(
@@ -529,23 +814,23 @@ def next_batch_recycling(loader_iter, loader):
 
 
 def resolve_mixed_lambda(
-    mixed_loader,
+    mixed_batches: int | None,
     steps_per_epoch: int,
     explicit: float | None,
 ) -> tuple[float, bool]:
     """
     Resolve mixed_lambda.
 
-    Auto (explicit is None): len(mixed_loader) / steps_per_epoch.
+    Auto (explicit is None): mixed_batches / steps_per_epoch.
     With recycling, each mixed batch is visited ~steps/N_m times per epoch; scaling
     by N_m/steps makes the cumulative weight per mixed batch equal to 1 — same as
     seeing each mixed batch once with lambda=1 and no recycle.
     """
     if explicit is not None:
         return float(explicit), False
-    if mixed_loader is None or steps_per_epoch <= 0:
+    if mixed_batches is None or mixed_batches <= 0 or steps_per_epoch <= 0:
         return float(DEFAULT_MIXED_LAMBDA), True
-    return float(len(mixed_loader)) / float(steps_per_epoch), True
+    return float(mixed_batches) / float(steps_per_epoch), True
 
 
 def steps_per_epoch_from_loaders(*loaders) -> int:
@@ -553,18 +838,83 @@ def steps_per_epoch_from_loaders(*loaders) -> int:
     return max(1, max(lengths)) if lengths else 1
 
 
-def main() -> None:
-    cli = parse_args()
-    active = parse_embodiments(cli.embodiments)
-    pkg = Path(__file__).resolve().parent
+def num_loader_batches(dataset, batch_size: int) -> int:
+    n = len(dataset)
+    if n <= 0:
+        return 0
+    return (n + int(batch_size) - 1) // int(batch_size)
 
-    if cli.seed is not None:
-        seed = int(cli.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+
+def steps_per_epoch_from_datasets(*datasets, batch_size: int) -> int:
+    lengths = [num_loader_batches(ds, batch_size) for ds in datasets if ds is not None]
+    return max(1, max(lengths)) if lengths else 1
+
+
+def main() -> None:
+    cli, parser = parse_args()
+    pkg = Path(__file__).resolve().parent
+    explicit = explicit_cli_dests(parser)
+    resume_path = resolve_existing_path(cli.resume_from) if cli.resume_from else None
+    resume_payload: dict[str, Any] | None = None
+    resume_model_state: dict[str, torch.Tensor] | None = None
+    exact_resume_requested = False
+    start_epoch = 0
+    step = 0
+    best = float("inf")
+    resume_mismatch_reasons: list[str] = []
+
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"--resume_from not found: {resume_path}")
+        raw_resume = torch.load(str(resume_path), map_location="cpu")
+        if is_full_training_checkpoint(raw_resume):
+            resume_payload = raw_resume
+            resume_model_state = raw_resume["model_state_dict"]
+            saved_cli = dict(raw_resume.get("cli_args", {}))
+            inherited = inherit_unspecified_cli(cli, saved_cli, explicit)
+            if inherited:
+                print(f"Inherited unspecified CLI flags from checkpoint: {inherited}")
+            if "embodiments" in saved_cli:
+                print(
+                    f"Resume checkpoint embodiments={sorted(parse_embodiments(saved_cli['embodiments']))}; "
+                    f"this run embodiments={sorted(parse_embodiments(cli.embodiments))}"
+                )
+            resume_mismatch_reasons = exact_resume_mismatches(saved_cli, cli)
+            if cli.resume_weights_only:
+                print(
+                    "--resume_weights_only set: loading model weights only "
+                    "(optimizer/scaler/epoch/RNG start fresh)."
+                )
+                exact_resume_requested = False
+            elif resume_mismatch_reasons:
+                print("Resume checkpoint will be used as a warm start only; exact resume disabled because:")
+                for reason in resume_mismatch_reasons:
+                    print(f"  - {reason}")
+                exact_resume_requested = False
+            else:
+                exact_resume_requested = True
+                start_epoch = int(raw_resume.get("next_epoch", 0))
+                step = int(raw_resume.get("global_step", 0))
+                best = float(raw_resume.get("best", float("inf")))
+        elif isinstance(raw_resume, dict):
+            resume_model_state = raw_resume
+            print(
+                f"Loading model weights from raw state_dict checkpoint {resume_path}; "
+                "optimizer/scaler/RNG state is unavailable, so this is a warm start."
+            )
+        else:
+            raise TypeError(f"Unsupported checkpoint payload type at {resume_path}: {type(raw_resume)!r}")
+
+    active = parse_embodiments(cli.embodiments)
+    if cli.seed is None:
+        cli.seed = random.SystemRandom().randrange(0, 2**31)
+        print(f"Auto-generated --seed={cli.seed} so resume checkpoints can continue deterministically.")
+    seed = int(cli.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     sessions_root = Path(cli.sessions_root).expanduser().resolve()
     discovered = discover_sessions_roots(sessions_root)
@@ -586,39 +936,38 @@ def main() -> None:
             "left_robot_right_hand|right_robot_left_hand/<date>."
         )
 
-    if cli.output_dir:
-        weights_root = Path(cli.output_dir).expanduser().resolve()
-    elif cli.weights_on_home:
-        # Real dir on /home — do not use pkg/weights (that is a symlink to /data).
-        weights_root = (pkg / "weights_home").resolve()
-    else:
-        weights_root = Path(f"/data/hfang09/{pkg.name}/weights")
-    run_name = cli.run_name or default_run_name()
-    output_dir = weights_root / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoints -> {output_dir}")
-
-    # Per-run sync tree avoids mushing CSVs across sessions_root / prior runs.
-    sync_root = pkg / "m-synced-csvs" / run_name
-
     gripper_thr = float(cli.gripper_binarize_threshold)
-    # mixed_lambda filled after loaders exist (may be auto from recycle ratio).
-    loss_cfg = {
-        "pose_w": float(cli.pose_loss_weight),
-        "joint_w": float(cli.joint_loss_weight),
-        "kl_w": float(cli.kl_weight),
-        "recon_kind": str(cli.reconstruction_loss),
-        "hand_lambda": float(cli.hand_lambda),
-        "mixed_lambda": float(DEFAULT_MIXED_LAMBDA),
-        "gripper_w": float(cli.gripper_loss_weight),
-    }
-
     robot_ds = None
     human_ds = None
     mixed_ds = None
     robot_eef_dir = None
     human_pose_dir = None
     mixed_sync_dirs: list[Path] = []
+
+    if cli.output_dir:
+        weights_root = Path(cli.output_dir).expanduser().resolve()
+        if exact_resume_requested and resume_path is not None and cli.run_name is None and weights_root == resume_path.parent:
+            output_dir = weights_root
+            run_name = output_dir.name
+        else:
+            run_name = cli.run_name or default_run_name()
+            output_dir = weights_root / run_name
+    elif exact_resume_requested and resume_path is not None and cli.run_name is None:
+        output_dir = resume_path.parent.resolve()
+        run_name = output_dir.name
+    else:
+        if cli.weights_on_home:
+            # Real dir on /home — do not use pkg/weights (that is a symlink to /data).
+            weights_root = (pkg / "weights_home").resolve()
+        else:
+            weights_root = Path(f"/data/hfang09/{pkg.name}/weights")
+        run_name = cli.run_name or default_run_name()
+        output_dir = weights_root / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints -> {output_dir}")
+
+    # Per-run sync tree avoids mushing CSVs across sessions_root / prior runs.
+    sync_root = pkg / "m-synced-csvs" / run_name
 
     if robot_root is not None:
         robot_eef_dir = resolve_robot_eef_dir(robot_root)
@@ -663,7 +1012,10 @@ def main() -> None:
     if human_root is not None:
         human_pose_dir = resolve_human_pose_dir(human_root)
         human_sync = sync_root / f"{human_root.name}_human"
-        build_human_sync_csvs(human_root, human_sync, human_pose_dir, cli.max_skew_s, cli.human_max_demos)
+        human_sync_cap = (
+            cli.human_sample_from_first_m if cli.human_sample_from_first_m is not None else cli.human_max_demos
+        )
+        build_human_sync_csvs(human_root, human_sync, human_pose_dir, cli.max_skew_s, human_sync_cap)
         human_ds = HumanEpisodeDataset(
             bird_vids_dir=human_root / "bird-realsense-data" / "mp4",
             front_vids_dir=human_root / "front-realsense-data" / "mp4",
@@ -671,6 +1023,8 @@ def main() -> None:
             sync_csv_dir=human_sync,
             num_queries=cli.num_queries,
             max_demos=cli.human_max_demos,
+            sample_max_demos_from_first=cli.human_sample_from_first_m,
+            selection_seed=cli.seed,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
             jpeg_in_ram=cli.jpeg_in_ram,
@@ -797,6 +1151,13 @@ def main() -> None:
     meta["robot_sample_from_first_m"] = (
         int(cli.robot_sample_from_first_m) if cli.robot_sample_from_first_m is not None else None
     )
+    meta["human_sample_from_first_m"] = (
+        int(cli.human_sample_from_first_m) if cli.human_sample_from_first_m is not None else None
+    )
+    meta["resume_from"] = str(resume_path) if resume_path is not None else None
+    meta["resume_exact"] = bool(exact_resume_requested)
+    meta["resume_next_epoch"] = int(start_epoch)
+    meta["resume_mismatches"] = list(resume_mismatch_reasons)
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
     print(f"Using device: {device}; active embodiments: {sorted(active)}; human_proprio=hard_removed")
@@ -804,63 +1165,55 @@ def main() -> None:
     optimizer = optim.AdamW(model.parameters(), lr=cli.lr, weight_decay=cli.weight_decay)
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
+    if resume_model_state is not None:
+        model.load_state_dict(resume_model_state)
+        print(f"Loaded model weights from {resume_path}")
+    if exact_resume_requested and resume_payload is not None:
+        optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        move_optimizer_state_to_device(optimizer, device)
+        scaler_state = resume_payload.get("scaler_state_dict")
+        if scaler_state:
+            try:
+                scaler.load_state_dict(scaler_state)
+            except Exception as exc:
+                print(f"Warning: could not restore GradScaler state ({exc}); continuing with a fresh scaler.")
+        restore_rng_state(resume_payload.get("rng_state"))
+        print(
+            f"Exact resume enabled from {resume_path}: next_epoch={start_epoch} "
+            f"global_step={step} best={best:.6f}"
+        )
 
-    # Per-modality seed offsets keep each loader's shuffle distinct but repeatable across runs.
-    base_seed = int(cli.seed) if cli.seed is not None else None
-    robot_loader = (
-        make_loader_seeded(
-            robot_ds,
-            batch_size=cli.batch,
-            num_workers=cli.num_workers,
-            shuffle=True,
-            seed=(base_seed + 0) if base_seed is not None else None,
-        )
-        if robot_ds is not None
-        else None
+    base_seed = int(cli.seed)
+    steps_per_epoch = steps_per_epoch_from_datasets(
+        robot_ds, human_ds, mixed_ds, batch_size=cli.batch
     )
-    human_loader = (
-        make_loader_seeded(
-            human_ds,
-            batch_size=cli.batch,
-            num_workers=cli.num_workers,
-            shuffle=True,
-            seed=(base_seed + 1) if base_seed is not None else None,
-        )
-        if human_ds is not None
-        else None
-    )
-    mixed_loader = (
-        make_loader_seeded(
-            mixed_ds,
-            batch_size=cli.batch,
-            num_workers=cli.num_workers,
-            shuffle=True,
-            seed=(base_seed + 2) if base_seed is not None else None,
-        )
-        if mixed_ds is not None
-        else None
-    )
-    active_loaders = [l for l in (robot_loader, human_loader, mixed_loader) if l is not None]
-    steps_per_epoch = steps_per_epoch_from_loaders(*active_loaders)
-    mixed_lambda, mixed_lambda_auto = resolve_mixed_lambda(mixed_loader, steps_per_epoch, cli.mixed_lambda)
-    cli.mixed_lambda = mixed_lambda
-    loss_cfg["mixed_lambda"] = mixed_lambda
+    mixed_batches = num_loader_batches(mixed_ds, cli.batch) if mixed_ds is not None else None
+    mixed_lambda, mixed_lambda_auto = resolve_mixed_lambda(mixed_batches, steps_per_epoch, cli.mixed_lambda)
+    loss_cfg = {
+        "pose_w": float(cli.pose_loss_weight),
+        "joint_w": float(cli.joint_loss_weight),
+        "kl_w": float(cli.kl_weight),
+        "recon_kind": str(cli.reconstruction_loss),
+        "hand_lambda": float(cli.hand_lambda),
+        "mixed_lambda": mixed_lambda,
+        "gripper_w": float(cli.gripper_loss_weight),
+    }
     meta["mixed_lambda"] = mixed_lambda
     meta["mixed_lambda_auto"] = bool(mixed_lambda_auto)
     meta["steps_per_epoch"] = int(steps_per_epoch)
-    if robot_loader is not None:
-        meta["robot_loader_batches"] = len(robot_loader)
+    if robot_ds is not None:
+        meta["robot_loader_batches"] = num_loader_batches(robot_ds, cli.batch)
         meta["robot_num_demos"] = len(robot_ds)
-    if human_loader is not None:
-        meta["human_loader_batches"] = len(human_loader)
+    if human_ds is not None:
+        meta["human_loader_batches"] = num_loader_batches(human_ds, cli.batch)
         meta["human_num_demos"] = len(human_ds)
-    if mixed_loader is not None:
-        meta["mixed_loader_batches"] = len(mixed_loader)
+    if mixed_ds is not None:
+        meta["mixed_loader_batches"] = int(mixed_batches or 0)
         meta["mixed_num_demos"] = len(mixed_ds)
         if mixed_lambda_auto:
             print(
                 f"mixed_lambda auto={mixed_lambda:.6g} "
-                f"(= mixed_batches/steps_per_epoch = {len(mixed_loader)}/{steps_per_epoch}; "
+                f"(= mixed_batches/steps_per_epoch = {mixed_batches}/{steps_per_epoch}; "
                 f"equiv. to one pass over mixed without recycling)"
             )
         else:
@@ -869,12 +1222,24 @@ def main() -> None:
 
     if cli.dry_run:
         print("--- MixedEmbodiment dry run ---")
+        robot_loader, human_loader, mixed_loader = build_epoch_loaders(
+            robot_ds=robot_ds,
+            human_ds=human_ds,
+            mixed_ds=mixed_ds,
+            batch_size=cli.batch,
+            num_workers=cli.num_workers,
+            base_seed=base_seed,
+            epoch=start_epoch,
+        )
         for name, loader in (("robot", robot_loader), ("human", human_loader), ("mixed", mixed_loader)):
             if loader is None:
                 continue
             batch = next(iter(loader))
             stats = train_step_single(model, optimizer, scaler, batch, device, use_amp, loss_cfg)
             print(f"{name.capitalize()} step OK: {stats}")
+        shutdown_loader(robot_loader)
+        shutdown_loader(human_loader)
+        shutdown_loader(mixed_loader)
         assert hasattr(model, "pose_action_head")
         print(
             f"Shared pose_action_head id={id(model.pose_action_head)} "
@@ -892,19 +1257,34 @@ def main() -> None:
             entity=cli.wandb_entity,
             name=cli.wandb_run_name,
             mode=cli.wandb_mode,
-            config=vars(cli),
+            config=dict(vars(cli)),
         )
-
-    best = float("inf")
-    step = 0
     print(
         f"Training schedule: {cli.epochs} epochs x {steps_per_epoch} steps/epoch "
-        f"(active={sorted(active)}; batches robot={len(robot_loader) if robot_loader else 0}, "
-        f"human={len(human_loader) if human_loader else 0}, mixed={len(mixed_loader) if mixed_loader else 0}; "
+        f"(active={sorted(active)}; batches robot={meta.get('robot_loader_batches', 0)}, "
+        f"human={meta.get('human_loader_batches', 0)}, mixed={meta.get('mixed_loader_batches', 0)}; "
         f"shorter modalities recycled), batch={cli.batch}, lr={cli.lr}, recon={cli.reconstruction_loss}, "
-        f"kl_weight={cli.kl_weight}, hand_lambda={cli.hand_lambda}, mixed_lambda={cli.mixed_lambda}, K={cli.num_queries}"
+        f"kl_weight={cli.kl_weight}, hand_lambda={cli.hand_lambda}, mixed_lambda={mixed_lambda}, K={cli.num_queries}"
     )
-    for epoch in range(cli.epochs):
+    if start_epoch >= cli.epochs:
+        print(
+            f"Checkpoint already reached next_epoch={start_epoch}, which is >= requested epochs={cli.epochs}; "
+            "nothing to do. Pass a larger --epochs to continue."
+        )
+    robot_loader = human_loader = mixed_loader = None
+    for epoch in range(start_epoch, cli.epochs):
+        shutdown_loader(robot_loader)
+        shutdown_loader(human_loader)
+        shutdown_loader(mixed_loader)
+        robot_loader, human_loader, mixed_loader = build_epoch_loaders(
+            robot_ds=robot_ds,
+            human_ds=human_ds,
+            mixed_ds=mixed_ds,
+            batch_size=cli.batch,
+            num_workers=cli.num_workers,
+            base_seed=base_seed,
+            epoch=epoch,
+        )
         model.train()
         robot_iter = iter(robot_loader) if robot_loader is not None else None
         human_iter = iter(human_loader) if human_loader is not None else None
@@ -1015,10 +1395,52 @@ def main() -> None:
         if (epoch + 1) >= cli.save_after_epochs:
             if avg < best:
                 best = avg
-                torch.save(model.state_dict(), output_dir / "mixed_act_best.pth")
-                print(f"Saved new best -> {output_dir / 'mixed_act_best.pth'}")
+                save_resume_checkpoint(
+                    path=output_dir / "mixed_act_best.pth",
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    cli=cli,
+                    active=active,
+                    meta=meta,
+                    epoch=epoch + 1,
+                    step=step,
+                    best=best,
+                    exact_resume_compatible=True,
+                )
+                print(f"Saved new best (full training state) -> {output_dir / 'mixed_act_best.pth'}")
             if cli.save_every_epochs > 0 and (epoch + 1) % cli.save_every_epochs == 0:
-                torch.save(model.state_dict(), output_dir / f"mixed_act_epoch_{epoch+1}.pth")
+                save_resume_checkpoint(
+                    path=output_dir / f"mixed_act_epoch_{epoch+1}.pth",
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    cli=cli,
+                    active=active,
+                    meta=meta,
+                    epoch=epoch + 1,
+                    step=step,
+                    best=best,
+                    exact_resume_compatible=True,
+                )
+                print(f"Saved periodic checkpoint -> {output_dir / f'mixed_act_epoch_{epoch+1}.pth'}")
+        save_resume_checkpoint(
+            path=output_dir / "mixed_act_resume_latest.pt",
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            cli=cli,
+            active=active,
+            meta=meta,
+            epoch=epoch + 1,
+            step=step,
+            best=best,
+            exact_resume_compatible=True,
+        )
+
+    shutdown_loader(robot_loader)
+    shutdown_loader(human_loader)
+    shutdown_loader(mixed_loader)
 
     if wandb_run is not None:
         wandb.finish()
