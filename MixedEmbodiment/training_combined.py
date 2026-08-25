@@ -106,6 +106,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help=(
+            "Warm-start from a checkpoint: load model weights only, then train from epoch 0 "
+            "with a fresh optimizer/scaler/RNG. Accepts a raw state_dict or a full training-state "
+            "file (uses model_state_dict). Does not continue optimizer/epoch state."
+        ),
+    )
+    p.add_argument(
         "--sessions_root",
         type=str,
         default=str(DEFAULT_SESSIONS_ROOT),
@@ -121,12 +131,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="robot,human,mixed",
         help=(
-            "Which of the three predecessor training regimes to run: 'robot' "
-            "(matches Bimanual-3cam), 'robot,human' (matches "
-            "Combined_relative_3cam_gripweight), or 'robot,human,mixed' (matches "
-            "MixedEmbodiment_gripweight, the default). No other combination is "
-            "accepted — robot is always the anchor, and mixed requires human. A "
-            "requested modality that isn't found under --sessions_root is skipped "
+            "Comma-separated subset of robot,human,mixed (any non-empty combination). "
+            "A requested modality that isn't found under --sessions_root is skipped "
             "with a warning; training fails only if zero modalities end up active."
         ),
     )
@@ -166,6 +172,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--human_max_demos", type=int, default=None,
         help="Use only the first N human demos (sorted demo IDs). None = all.",
+    )
+    p.add_argument(
+        "--human_sample_from_first_m",
+        type=int,
+        default=None,
+        help=(
+            "Human only: when --human_max_demos=N is set, sample those N demos without replacement "
+            "from the first M sorted human demos, using --seed for determinism."
+        ),
     )
     p.add_argument(
         "--mixed_max_demos", type=int, default=None,
@@ -263,20 +278,6 @@ class Args:
         self.dilation = False
 
 
-# The only three supported combinations, matching the three predecessor folders
-# exactly: Bimanual-3cam (robot alone — different model class, but this is the
-# nearest equivalent run within this architecture), Combined_relative_3cam_gripweight
-# (robot+human, always required together), and MixedEmbodiment_gripweight
-# (robot+human+mixed). robot is always the anchor; mixed requires human. There is
-# no human-alone, mixed-alone, or human+mixed-without-robot mode — those never
-# existed in any predecessor and aren't validated against one.
-VALID_EMBODIMENT_SETS = (
-    frozenset({"robot"}),
-    frozenset({"robot", "human"}),
-    frozenset({"robot", "human", "mixed"}),
-)
-
-
 def parse_embodiments(spec: str) -> set[str]:
     requested = {tok.strip().lower() for tok in spec.split(",") if tok.strip()}
     unknown = requested - set(EMBODIMENT_NAMES)
@@ -284,14 +285,14 @@ def parse_embodiments(spec: str) -> set[str]:
         raise ValueError(f"Unknown --embodiments entries {sorted(unknown)}; choose from {EMBODIMENT_NAMES}")
     if not requested:
         raise ValueError("--embodiments must name at least one of robot,human,mixed")
-    if frozenset(requested) not in VALID_EMBODIMENT_SETS:
-        raise ValueError(
-            f"--embodiments={sorted(requested)} is not supported. Only robot / "
-            "robot,human / robot,human,mixed are supported (matching Bimanual-3cam / "
-            "Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight respectively) "
-            "— robot is always the anchor, and mixed requires human."
-        )
     return requested
+
+
+def unwrap_model_state_dict(payload: object) -> object:
+    """Accept a raw model state_dict or a full training-state checkpoint."""
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"]
+    return payload
 
 
 def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
@@ -663,7 +664,10 @@ def main() -> None:
     if human_root is not None:
         human_pose_dir = resolve_human_pose_dir(human_root)
         human_sync = sync_root / f"{human_root.name}_human"
-        build_human_sync_csvs(human_root, human_sync, human_pose_dir, cli.max_skew_s, cli.human_max_demos)
+        human_sync_cap = (
+            cli.human_sample_from_first_m if cli.human_sample_from_first_m is not None else cli.human_max_demos
+        )
+        build_human_sync_csvs(human_root, human_sync, human_pose_dir, cli.max_skew_s, human_sync_cap)
         human_ds = HumanEpisodeDataset(
             bird_vids_dir=human_root / "bird-realsense-data" / "mp4",
             front_vids_dir=human_root / "front-realsense-data" / "mp4",
@@ -671,6 +675,8 @@ def main() -> None:
             sync_csv_dir=human_sync,
             num_queries=cli.num_queries,
             max_demos=cli.human_max_demos,
+            sample_max_demos_from_first=cli.human_sample_from_first_m,
+            selection_seed=cli.seed,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
             jpeg_in_ram=cli.jpeg_in_ram,
@@ -797,10 +803,30 @@ def main() -> None:
     meta["robot_sample_from_first_m"] = (
         int(cli.robot_sample_from_first_m) if cli.robot_sample_from_first_m is not None else None
     )
+    meta["human_sample_from_first_m"] = (
+        int(cli.human_sample_from_first_m) if cli.human_sample_from_first_m is not None else None
+    )
+    meta["resume_from"] = str(Path(cli.resume_from).expanduser()) if cli.resume_from else None
+    meta["resume_mode"] = "warm_start" if cli.resume_from else None
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
     print(f"Using device: {device}; active embodiments: {sorted(active)}; human_proprio=hard_removed")
     model = build(Args(cli.num_queries)).to(device)
+    if cli.resume_from:
+        ckpt_path = Path(cli.resume_from).expanduser()
+        ckpt_path = ckpt_path.resolve() if ckpt_path.is_absolute() else (Path.cwd() / ckpt_path).resolve()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"--resume_from not found: {ckpt_path}")
+        try:
+            payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(str(ckpt_path), map_location="cpu")
+        state_dict = unwrap_model_state_dict(payload)
+        model.load_state_dict(state_dict)
+        print(
+            f"Warm start: loaded model weights from {ckpt_path}; "
+            "optimizer/scaler/epoch/RNG start fresh."
+        )
     optimizer = optim.AdamW(model.parameters(), lr=cli.lr, weight_decay=cli.weight_decay)
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
