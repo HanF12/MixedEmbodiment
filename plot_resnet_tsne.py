@@ -624,21 +624,45 @@ def collect_strided_refs(
     include_mixed: bool,
     mixed_datasets: list[tuple[Any, str]] | None = None,
     skip_first_s: float = 0.0,
+    skip_last_s: float = 0.0,
+    skip_first_s_robot: float | None = None,
+    skip_last_s_robot: float | None = None,
+    skip_first_s_human: float | None = None,
+    skip_last_s_human: float | None = None,
+    skip_first_s_mixed: float | None = None,
+    skip_last_s_mixed: float | None = None,
     frame_hz: float = 15.0,
 ) -> list[FrameRef]:
     """Index every Nth frame — metadata only, no image tensors."""
     stride = max(1, int(frame_stride))
-    skip_n = int(round(max(0.0, float(skip_first_s)) * float(frame_hz))) if float(skip_first_s) > 0 else 0
 
-    def from_episode_ds(ds, dataset_type: str, embodiment: int) -> list[FrameRef]:
+    def _skip_s(override: float | None, default: float) -> float:
+        return float(default) if override is None else float(override)
+
+    def _skip_n(seconds: float) -> int:
+        s = max(0.0, float(seconds))
+        return int(round(s * float(frame_hz))) if s > 0 else 0
+
+    def from_episode_ds(
+        ds,
+        dataset_type: str,
+        embodiment: int,
+        *,
+        first_s: float,
+        last_s: float,
+    ) -> list[FrameRef]:
+        skip_first_n = _skip_n(first_s)
+        skip_last_n = _skip_n(last_s)
         out: list[FrameRef] = []
         skipped_eps = 0
         for ep in range(int(ds.num_demos)):
             ep_len = int(ds.demo_lengths[ep])
-            if skip_n >= ep_len:
+            lo = skip_first_n
+            hi = ep_len - skip_last_n
+            if hi <= lo:
                 skipped_eps += 1
                 continue
-            for start in range(skip_n, ep_len, stride):
+            for start in range(lo, hi, stride):
                 out.append(
                     FrameRef(
                         dataset_type=dataset_type,
@@ -652,19 +676,32 @@ def collect_strided_refs(
                 )
                 if max_frames_per_type is not None and len(out) >= max_frames_per_type:
                     return out
-        if skip_n > 0:
+        if skip_first_n > 0 or skip_last_n > 0:
             print(
-                f"  {dataset_type}: skip_first_s={skip_first_s:g}s (~{skip_n} frames @ {frame_hz:g} Hz); "
-                f"dropped {skipped_eps}/{int(ds.num_demos)} demos shorter than the skip",
+                f"  {dataset_type}: skip_first_s={first_s:g}s (~{skip_first_n} frames) "
+                f"skip_last_s={last_s:g}s (~{skip_last_n} frames) @ {frame_hz:g} Hz; "
+                f"dropped {skipped_eps}/{int(ds.num_demos)} demos with no remaining frames",
                 flush=True,
             )
         return out
 
     refs: list[FrameRef] = []
     if robot_ds is not None:
-        refs += from_episode_ds(robot_ds, "teleop", EMBODIMENT_ROBOT)
+        refs += from_episode_ds(
+            robot_ds,
+            "teleop",
+            EMBODIMENT_ROBOT,
+            first_s=_skip_s(skip_first_s_robot, skip_first_s),
+            last_s=_skip_s(skip_last_s_robot, skip_last_s),
+        )
     if human_ds is not None:
-        refs += from_episode_ds(human_ds, "human", EMBODIMENT_HUMAN)
+        refs += from_episode_ds(
+            human_ds,
+            "human",
+            EMBODIMENT_HUMAN,
+            first_s=_skip_s(skip_first_s_human, skip_first_s),
+            last_s=_skip_s(skip_last_s_human, skip_last_s),
+        )
     if include_mixed:
         pairs = list(mixed_datasets or [])
         if not pairs:
@@ -674,8 +711,10 @@ def collect_strided_refs(
                 pairs.append((mixed_rl, "right_robot_left_hand"))
         if not pairs:
             raise ValueError("Mixed datasets required when include_mixed=True")
+        mixed_first = _skip_s(skip_first_s_mixed, skip_first_s)
+        mixed_last = _skip_s(skip_last_s_mixed, skip_last_s)
         for ds, label in pairs:
-            refs += from_episode_ds(ds, label, EMBODIMENT_MIXED)
+            refs += from_episode_ds(ds, label, EMBODIMENT_MIXED, first_s=mixed_first, last_s=mixed_last)
     return refs
 
 
@@ -1030,6 +1069,55 @@ def scatter_by_dataset(
     plt.close(fig)
 
 
+def align_xy_to_ref(xy: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Orthogonal Procrustes (rotation + reflection + scale) of xy onto ref."""
+    src = np.asarray(xy, dtype=np.float64)
+    dst = np.asarray(ref, dtype=np.float64)
+    if src.shape != dst.shape or src.shape[0] < 2:
+        return np.asarray(xy, dtype=np.float32)
+    mu_src = src.mean(axis=0, keepdims=True)
+    mu_dst = dst.mean(axis=0, keepdims=True)
+    a = src - mu_src
+    b = dst - mu_dst
+    u, _, vt = np.linalg.svd(a.T @ b, full_matrices=False)
+    rot = u @ vt
+    aligned = a @ rot
+    denom = float((aligned * aligned).sum())
+    scale = float((aligned * b).sum()) / denom if denom > 1e-12 else 1.0
+    return (aligned * scale + mu_dst).astype(np.float32)
+
+
+def align_xy_by_ckpt(
+    xy_by_ckpt: list[dict[str, np.ndarray]],
+    type_lists: list[list[str]],
+) -> list[dict[str, np.ndarray]]:
+    """Align ckpt 1..N 2D coords onto ckpt 0 when they share the same point count."""
+    if len(xy_by_ckpt) < 2:
+        return xy_by_ckpt
+    out = [dict(xy_by_ckpt[0])]
+    for i in range(1, len(xy_by_ckpt)):
+        aligned = {}
+        for method, xy in xy_by_ckpt[i].items():
+            ref = xy_by_ckpt[0][method]
+            if xy.shape[0] != ref.shape[0]:
+                print(
+                    f"  skip 2D align {method} col{i}: N={xy.shape[0]} vs ref N={ref.shape[0]} "
+                    "(use the same --embodiments so every ckpt sees the same frames)",
+                    flush=True,
+                )
+                aligned[method] = xy
+                continue
+            if type_lists[i] != type_lists[0]:
+                print(
+                    f"  2D align {method} col{i}: point count matches but dataset labels differ; "
+                    "aligning by row order anyway",
+                    flush=True,
+                )
+            aligned[method] = align_xy_to_ref(xy, ref)
+        out.append(aligned)
+    return out
+
+
 def _union_dataset_order(type_lists: Sequence[Sequence[str]]) -> tuple[str, ...]:
     present = set()
     for types in type_lists:
@@ -1055,6 +1143,7 @@ def save_side_by_side_grid(
     perplexity: float,
     umap_n_neighbors: int,
     umap_min_dist: float,
+    shared_axis_limits: bool = True,
 ) -> Path:
     """
     Save a 3xN grid (rows: PCA/t-SNE/UMAP, cols: checkpoints) for one feature.
@@ -1067,8 +1156,8 @@ def save_side_by_side_grid(
     axis_labels = (("PC1", "PC2"), ("t-SNE 1", "t-SNE 2"), ("UMAP 1", "UMAP 2"))
     dataset_order = _union_dataset_order(type_lists)
 
-    fig_w = 5.2 * n_ckpts
-    fig_h = 3.9 * len(methods)
+    fig_w = 5.4 * n_ckpts + 1.1
+    fig_h = 4.1 * len(methods)
     fig, axes = plt.subplots(
         nrows=len(methods),
         ncols=n_ckpts,
@@ -1077,22 +1166,44 @@ def save_side_by_side_grid(
         squeeze=False,
     )
     for col, title in enumerate(ckpt_titles):
-        axes[0, col].set_title(title)
+        axes[0, col].set_title(title, fontsize=10, pad=8)
     for row, (method, row_lab, (xlab, ylab)) in enumerate(zip(methods, row_labels, axis_labels)):
+        row_xys = [xy_by_ckpt[col][method] for col in range(n_ckpts)]
+        if shared_axis_limits:
+            xs = np.concatenate([xy[:, 0] for xy in row_xys])
+            ys = np.concatenate([xy[:, 1] for xy in row_xys])
+            pad_x = 0.05 * max(float(xs.max() - xs.min()), 1e-6)
+            pad_y = 0.05 * max(float(ys.max() - ys.min()), 1e-6)
+            xlim = (float(xs.min()) - pad_x, float(xs.max()) + pad_x)
+            ylim = (float(ys.min()) - pad_y, float(ys.max()) + pad_y)
+        else:
+            xlim = ylim = None
         for col in range(n_ckpts):
             ax = axes[row, col]
-            xy = xy_by_ckpt[col][method]
+            xy = row_xys[col]
             _scatter_by_dataset_ax(
                 ax,
                 xy,
                 type_lists[col],
                 dataset_order=dataset_order,
                 title="",  # column titles handled above
-                xlabel=xlab if row == len(methods) - 1 else "",
+                xlabel=(f"{xlab}\n{ckpt_titles[col]}" if row == len(methods) - 1 else ""),
                 ylabel=ylab if col == 0 else "",
                 show_legend=False,
             )
+            if xlim is not None and ylim is not None:
+                ax.set_xlim(*xlim)
+                ax.set_ylim(*ylim)
         axes[row, 0].set_ylabel(f"{row_lab} ({axis_labels[row][1]})")
+        axes[row, -1].annotate(
+            ckpt_titles[-1].replace("\n", " | "),
+            xy=(1.02, 0.5),
+            xycoords="axes fraction",
+            va="center",
+            ha="left",
+            rotation=270,
+            fontsize=8,
+        )
 
     handles = []
     for dt in dataset_order:
@@ -1116,7 +1227,7 @@ def save_side_by_side_grid(
         fontsize=12,
     )
     out_path = out_dir / f"side_by_side_{feat_name}_{n_ckpts}ckpts.png"
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -1204,16 +1315,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "Drop the first N seconds of each demo before sampling "
-            "(synced rows are ~15 Hz bird; use --frame_hz to override). "
-            "Demos shorter than this contribute no points."
+            "Default: drop the first N seconds of every demo. "
+            "Overridden per modality by --skip_first_s_robot / _human / _mixed."
         ),
     )
+    p.add_argument(
+        "--skip_last_s",
+        type=float,
+        default=0.0,
+        help=(
+            "Default: drop the last N seconds of every demo. "
+            "Overridden per modality by --skip_last_s_robot / _human / _mixed."
+        ),
+    )
+    p.add_argument("--skip_first_s_robot", type=float, default=None, help="Skip first N seconds of teleop demos")
+    p.add_argument("--skip_last_s_robot", type=float, default=None, help="Skip last N seconds of teleop demos")
+    p.add_argument("--skip_first_s_human", type=float, default=None, help="Skip first N seconds of human demos")
+    p.add_argument("--skip_last_s_human", type=float, default=None, help="Skip last N seconds of human demos")
+    p.add_argument("--skip_first_s_mixed", type=float, default=None, help="Skip first N seconds of mixed demos")
+    p.add_argument("--skip_last_s_mixed", type=float, default=None, help="Skip last N seconds of mixed demos")
     p.add_argument(
         "--frame_hz",
         type=float,
         default=15.0,
-        help="Hz used to convert --skip_first_s into a frame offset (default 15, the recorded bird rate)",
+        help="Hz used to convert skip-*-s flags into frame offsets (default 15, the recorded bird rate)",
     )
     p.add_argument(
         "--shared_frames_only",
@@ -1272,6 +1397,21 @@ def parse_args() -> argparse.Namespace:
             "When passing 2–3 checkpoints, also write a 3xN side-by-side grid "
             "per feature (rows PCA/t-SNE/UMAP, columns checkpoints)."
         ),
+    )
+    p.add_argument(
+        "--align_2d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For side-by-side grids, Procrustes-align each later checkpoint's 2D coords "
+            "onto the first column (same N required). Use --no-align_2d to disable."
+        ),
+    )
+    p.add_argument(
+        "--shared_axis_limits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Share xlim/ylim across side-by-side columns in each row. Use --no-shared_axis_limits to disable.",
     )
     p.add_argument("--backbone", type=str, default="resnet18", help="Passed to model build()")
     p.add_argument("--perplexity", type=float, default=30.0, help="t-SNE perplexity")
@@ -1382,8 +1522,13 @@ def main() -> None:
     print(f"device={device} cpu_threads={n_threads}", flush=True)
     print(
         f"frame_stride={args.frame_stride} max_demos={max_demos} "
-        f"max_frames_per_type={max_per_type} skip_first_s={float(args.skip_first_s):g} "
-        f"frame_hz={float(args.frame_hz):g} camera=bird (wrists unused) "
+        f"max_frames_per_type={max_per_type} "
+        f"skip_first_s={float(args.skip_first_s):g} "
+        f"(robot={args.skip_first_s_robot} human={args.skip_first_s_human} mixed={args.skip_first_s_mixed}) "
+        f"skip_last_s={float(args.skip_last_s):g} "
+        f"(robot={args.skip_last_s_robot} human={args.skip_last_s_human} mixed={args.skip_last_s_mixed}) "
+        f"frame_hz={float(args.frame_hz):g} "
+        f"camera=bird (wrists unused) "
         f"embodiments={sorted(active)} (cli={args.embodiments}) "
         f"shared_frames_only={bool(args.shared_frames_only)}",
         flush=True,
@@ -1498,6 +1643,13 @@ def main() -> None:
         include_mixed=load_mixed,
         mixed_datasets=mixed_pairs if load_mixed else None,
         skip_first_s=float(args.skip_first_s),
+        skip_last_s=float(args.skip_last_s),
+        skip_first_s_robot=args.skip_first_s_robot,
+        skip_last_s_robot=args.skip_last_s_robot,
+        skip_first_s_human=args.skip_first_s_human,
+        skip_last_s_human=args.skip_last_s_human,
+        skip_first_s_mixed=args.skip_first_s_mixed,
+        skip_last_s_mixed=args.skip_last_s_mixed,
         frame_hz=float(args.frame_hz),
     )
     refs_combined = [r for r in refs_shared if r.dataset_type in DATASET_TYPES_COMBINED]
@@ -1512,6 +1664,13 @@ def main() -> None:
         "max_demos": max_demos,
         "max_frames_per_type": max_per_type,
         "skip_first_s": float(args.skip_first_s),
+        "skip_last_s": float(args.skip_last_s),
+        "skip_first_s_robot": args.skip_first_s_robot,
+        "skip_last_s_robot": args.skip_last_s_robot,
+        "skip_first_s_human": args.skip_first_s_human,
+        "skip_last_s_human": args.skip_last_s_human,
+        "skip_first_s_mixed": args.skip_first_s_mixed,
+        "skip_last_s_mixed": args.skip_last_s_mixed,
         "frame_hz": float(args.frame_hz),
         "shared_frames_only": bool(args.shared_frames_only),
         "embodiments_cli": str(args.embodiments),
@@ -1665,7 +1824,7 @@ def main() -> None:
             dec_xy = None
 
         if bool(args.side_by_side) and 2 <= len(ckpts) <= 3:
-            ckpt_title = f"{pkg}:{ckpt.stem}"
+            ckpt_title = f"{ckpt.parent.name}\n{ckpt.stem}"
             for feat_name, xy in (
                 (str(args.extractor), feat_xy),
                 ("encoder_memory", enc_xy),
@@ -1709,21 +1868,27 @@ def main() -> None:
             raise RuntimeError("Internal error: side_by_side_dir was not set")
         wrote = {}
         for feat_name, blob in grids.items():
+            xy_by_ckpt = blob["xy"]
+            if bool(args.align_2d):
+                xy_by_ckpt = align_xy_by_ckpt(xy_by_ckpt, blob["types"])
             out_path = save_side_by_side_grid(
                 out_dir=side_by_side_dir,
                 feat_name=feat_name,
                 ckpt_titles=blob["titles"],
                 type_lists=blob["types"],
-                xy_by_ckpt=blob["xy"],
+                xy_by_ckpt=xy_by_ckpt,
                 seed=int(args.seed),
                 perplexity=float(args.perplexity),
                 umap_n_neighbors=int(args.umap_n_neighbors),
                 umap_min_dist=float(args.umap_min_dist),
+                shared_axis_limits=bool(args.shared_axis_limits),
             )
             wrote[feat_name] = str(out_path)
             print(f"  wrote {out_path}", flush=True)
         summary["side_by_side"] = wrote
         summary["side_by_side_out_dir"] = str(side_by_side_dir)
+        summary["align_2d"] = bool(args.align_2d)
+        summary["shared_axis_limits"] = bool(args.shared_axis_limits)
         with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
