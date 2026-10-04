@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torchvision import transforms
 
+from MixedEmbodiment.config import POSE_GRIP_INDICES
+
 
 def resolve_path(path_like: str | Path) -> Path:
     path = Path(path_like).expanduser()
@@ -85,12 +87,13 @@ def relative_pose_chunk(
     anchor: torch.Tensor,
 ) -> list[torch.Tensor]:
     """
-    Convert absolute pose steps to deltas vs the chunk anchor (first observation).
+    Convert absolute pose steps to chunk-anchored pose targets.
 
-      relative[k] = absolute[k] - anchor
+    Non-gripper dims are deltas vs the anchor; gripper dims stay absolute.
 
     The anchor must be the pose at the first observation in the chunk (t), not the
-    previous timestep. With chunk start at t, relative[0] is zeros.
+    previous timestep. With chunk start at t, the non-gripper part of target[0]
+    is zeros while gripper dims match the anchor pose.
     """
     anchor_t = torch.as_tensor(anchor, dtype=torch.float32).reshape(-1)
     out: list[torch.Tensor] = []
@@ -100,7 +103,10 @@ def relative_pose_chunk(
             raise ValueError(
                 f"Pose dim mismatch for relative chunk: step={step_t.numel()} anchor={anchor_t.numel()}"
             )
-        out.append(step_t - anchor_t)
+        target_t = step_t - anchor_t
+        for idx in POSE_GRIP_INDICES:
+            target_t[idx] = step_t[idx]
+        out.append(target_t)
     return out
 
 
@@ -110,9 +116,10 @@ def absolute_pose_from_relative(
     anchor: torch.Tensor | np.ndarray,
 ) -> torch.Tensor:
     """
-    Inference: re-anchor a relative pose chunk to the first observation pose.
+    Inference: re-anchor chunked pose targets to the first observation pose.
 
-      absolute[k] = anchor + relative[k]
+    Non-gripper dims are stored as deltas, while gripper dims are already
+    absolute and pass through unchanged.
 
     relative_actions: [K, D] or [D]
     anchor: [D] absolute pose at the chunk's first observation.
@@ -122,10 +129,16 @@ def absolute_pose_from_relative(
     if rel.ndim == 1:
         if rel.numel() != anc.numel():
             raise ValueError(f"Pose dim mismatch: rel={rel.numel()} anchor={anc.numel()}")
-        return rel + anc
+        out = rel + anc
+        for idx in POSE_GRIP_INDICES:
+            out[idx] = rel[idx]
+        return out
     if rel.ndim != 2 or rel.shape[-1] != anc.numel():
         raise ValueError(f"Expected relative [K,{anc.numel()}], got {tuple(rel.shape)}")
-    return rel + anc.unsqueeze(0)
+    out = rel + anc.unsqueeze(0)
+    for idx in POSE_GRIP_INDICES:
+        out[:, idx] = rel[:, idx]
+    return out
 
 
 def compute_relative_pose_stats(
@@ -136,10 +149,11 @@ def compute_relative_pose_stats(
     num_queries: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Mean/std of chunk-anchored relative pose targets over the full dataset.
+    Mean/std of chunk-anchored pose targets over the full dataset.
 
     For every valid start index t inside each episode:
-      delta[k] = pose[t+k] - pose[t]  for k = 0 .. min(K, remaining)-1
+      target[k] = pose[t+k] - pose[t] for non-gripper dims
+      target[k] = pose[t+k]           for gripper dims
     """
     deltas: list[torch.Tensor] = []
     k = int(num_queries)
@@ -151,7 +165,10 @@ def compute_relative_pose_stats(
             slice_end = min(demo_end, sample_idx + k)
             for j in range(sample_idx, slice_end):
                 step = torch.as_tensor(pose_data[j], dtype=torch.float32).reshape(-1)
-                deltas.append(step - anchor)
+                target = step - anchor
+                for idx in POSE_GRIP_INDICES:
+                    target[idx] = step[idx]
+                deltas.append(target)
     if not deltas:
         raise RuntimeError("No relative pose samples available to compute stats")
     all_d = torch.stack(deltas, dim=0)
